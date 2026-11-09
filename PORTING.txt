@@ -1,0 +1,132 @@
+LiveChat68 - porting notes
+==========================
+
+The door is plain C99. examples/livechat/livechat.c and livechat_ui.c contain
+no #ifdef for the Amiga or any other platform. The proof is "make test": it
+compiles the whole door, unchanged, for the machine you build on (the
+reference build is ARM64 macOS with -Wall -Wextra -Werror) and drives it
+against a stub chat server.
+
+So a new CPU is a recompile. A new BBS needs one layer rewritten: the part
+that talks to the board. Everything else is shared.
+
+
+1. THE LAYERS
+-------------
+
+  examples/livechat/   The door: commands, rooms, private and group messages,
+                       menus, help, themes. Board-independent.
+
+  ui_*.c               Screen code. Draws into a cell buffer and writes ANSI
+                       to the caller. Board-independent. Needs the caller's
+                       screen size (default 80x25 when the board says
+                       nothing).
+
+  ae_chat.c            Chat hub client (see section 3). Board-independent.
+  ae_http.c ae_net.c   HTTP/1.1 over TCP; TLS in ae_net_tls.c. On the Amiga
+  ae_net_tls.c         these use bsdsocket.library and AmiSSL; elsewhere POSIX
+  json_lite.c          sockets and OpenSSL 3. The split is inside the files
+                       (#ifdef AMIGA), already done for both.
+
+  BOARD LAYER - the part to port:
+
+  aedoor.h             The door's whole view of the BBS: 15 functions.
+                         ae_start ae_shutdown ae_fatal       start and end
+                         ae_put ae_get ae_key                text in and out
+                         ae_input_pending ae_delay_ticks     polling and time
+                         ae_check ae_raw_arrows              carrier, keys
+                         ae_return_command
+                         ae_field_read ae_field_write        board data
+                         ae_field_exchange ae_query_bit
+  ae_transport_amiga.c Implements aedoor.h with the AmiExpress XIM door
+                       message port. This is the file to replace.
+  ae_transport_native.c Implements aedoor.h over stdio. The tests use it,
+                       and it is the closest starting point for a board that
+                       runs doors with the caller on stdin/stdout (most Unix
+                       and Windows BBS packages, with a drop file).
+  ae_dos_amiga.c       File access through dos.library (reads and writes
+  ae_dos_native.c      LIVECHAT.cfg). The native file uses stdio; use it
+                       as-is on anything that is not AmigaOS.
+  ae_host.c            Reads AE_HOST from the environment to learn whether
+                       the board is AmiExpress-web or a classic AmiExpress.
+                       With no variable set, the door assumes the safe
+                       classic answer. No change needed.
+
+
+2. WHAT THE DOOR ASKS THE BOARD
+-------------------------------
+
+Through ae_field_read / ae_field_exchange (field numbers in ae_session.h):
+
+  Required:
+    user name      the caller's handle; the chat identity is handle@BOARD
+    user level     the caller's access level (sysop commands need 255)
+
+  Optional - the door works without them and says so where it matters:
+    screen size    AEW_SCREEN (10800); default 80x25
+    mouse          AEW_SCREEN; no mouse when unanswered
+    theme          the caller's theme id; "" = default theme, and choosing
+                   a theme says it cannot be saved on this board
+    chat prefs     AEW_CHATPREFS (11300); defaults when unanswered
+    user notes     AEW_USERNOTE (11200); sysop notes are skipped
+
+A classic AmiExpress answers only the required ones. That is the minimum a
+port must answer too: map "user name" and "user level" to your board's own
+user record (drop file, door API, or environment), and return 0 ("not
+answered") from ae_field_read for every other field number.
+
+
+3. THE CHAT HUB PROTOCOL
+------------------------
+
+The hub is doors.uprough.net, HTTPS on port 443. Routes start with
+/chat/v1. Every request carries
+
+    Authorization: Board <board-key>
+
+and, after a session is opened, X-Chat-Session: <sid>.
+
+  POST /achievements/v1/boards/register   one-time; returns the board key.
+                                          The door's setup screen does this
+                                          and writes BoardKey to LIVECHAT.cfg.
+  POST /chat/v1/sessions                  open a session for one caller
+  DELETE /chat/v1/sessions/current        close it
+  GET  /chat/v1/rooms.txt                 room list
+  ...                                     see ae_chat.h, one function per
+                                          route, in the hub's field order
+
+Replies to list and event calls are plain text rows, fields separated by
+"|" (a literal "|" travels as "!"). Only the session reply is JSON. This
+keeps the client small enough for a 68000 with no JSON library.
+
+The board key identifies your board on the hub. Keep it secret: anyone who
+has it can post as your board. It belongs in LIVECHAT.cfg only, never in
+source, never in a public repository.
+
+
+4. A PORT, STEP BY STEP
+-----------------------
+
+  1. Copy src/ae_transport_native.c to src/ae_transport_<yourbbs>.c.
+  2. Make ae_start() read your board's door interface (drop file, socket,
+     environment) and keep the caller's name and level.
+  3. Make ae_put/ae_get/ae_key/ae_input_pending talk to the caller's line.
+     Output is ANSI; input expects raw keys, with arrow keys as ANSI escape
+     sequences.
+  4. Make ae_field_read answer the user name and user level fields; 0 for
+     the rest.
+  5. In the Makefile, swap ae_transport_native for your file in the host
+     build, add a door target that links the same object list as
+     build/test_chat minus the tests, and build with OpenSSL.
+  6. Run "make test" first: it must stay green, because it exercises the
+     door and the hub client without any board.
+  7. Copy LIVECHAT.cfg.example to LIVECHAT.cfg beside the binary, start the
+     door as a caller, and run the setup screen to register your board.
+
+
+5. LIMITS TODAY
+---------------
+
+  * Voice, microphone and video print "not on Amiga yet".
+  * Drawing waits for the C port of the ANSI editor.
+  * File sharing in chat is not wired yet.

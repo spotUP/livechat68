@@ -1,0 +1,9 @@
+# LIVECHAT68 - copy to LIVECHAT.cfg beside the door and fill in. Never commit LIVECHAT.cfg.
+Host=doors.uprough.net
+Port=443
+Tls=1
+# Plain HTTP (no encryption, the board key travels in clear text) needs both:
+# Tls=0
+# AllowPlainHttp=1
+BoardKey=<board-id>.<secret>
+Timeout=10
