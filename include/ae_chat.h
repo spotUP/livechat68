@@ -248,6 +248,12 @@ int ae_chat_motd(ae_chat *c, char *text, int cap);
 /** PUT /motd {text}; empty text clears. Sysop only. */
 int ae_chat_motd_set(ae_chat *c, const char *text);
 
+/** GET /discord: whether this board's chat is mirrored to Discord, into *on (0 or 1). */
+int ae_chat_discord(ae_chat *c, int *on);
+
+/** PUT /discord {on}: switch the mirror (sysop session only, else AE_CHAT_ERR_STATUS with error "forbidden"). *on gets the hub's answer. */
+int ae_chat_discord_set(ae_chat *c, int on, int *now);
+
 /** DELETE /rooms/:id. */
 int ae_chat_room_delete(ae_chat *c, const char *room);
 

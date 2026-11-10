@@ -1031,6 +1031,29 @@ int ae_chat_motd_set(ae_chat *c, const char *text)
     return call(c, "PUT", AE_CHAT_BASE "/motd", body, (unsigned long)at);
 }
 
+static int discord_reply(ae_chat *c, int rc, int *on)
+{
+    int v;
+    if (rc != AE_CHAT_OK) return rc;
+    if (json_extract_bool(c->reply, "on", &v) != 0) return AE_CHAT_ERR_BODY;
+    if (on != 0) *on = v != 0;
+    return AE_CHAT_OK;
+}
+
+int ae_chat_discord(ae_chat *c, int *on)
+{
+    return discord_reply(c, call(c, "GET", AE_CHAT_BASE "/discord", 0, 0), on);
+}
+
+int ae_chat_discord_set(ae_chat *c, int on, int *now)
+{
+    char body[BODY_MAX];
+    long at = ae_req_put_raw(body, sizeof body, 0, on ? "{\"on\":true}" : "{\"on\":false}");
+
+    if (at < 0) return AE_CHAT_ERR_TOO_LONG;
+    return discord_reply(c, call(c, "PUT", AE_CHAT_BASE "/discord", body, (unsigned long)at), now);
+}
+
 int ae_chat_room_delete(ae_chat *c, const char *room)
 {
     char path[PATH_MAX_LEN];

@@ -369,8 +369,8 @@ static void load_ignores(void)
 }
 
 /** A message, inserted by seq among the messages; one already shown (same id) is not shown twice. */
-static lc_line *add_message(int kind, long seq, const char *id, const char *nick, const char *at, const char *text,
-                            const char *reply_to)
+static lc_line *add_message(int kind, long seq, const char *id, const char *nick, const char *label, const char *at,
+                            const char *text, const char *reply_to)
 {
     int pos = M.nlines;
     lc_line *l;
@@ -388,6 +388,7 @@ static lc_line *add_message(int kind, long seq, const char *id, const char *nick
     l->number = ++msg_number;
     clean(l->id, sizeof l->id, id);
     clean(l->nick, sizeof l->nick, nick);
+    clean(l->label, sizeof l->label, label);
     clean(l->text, sizeof l->text, text);
     hhmm_of(l->time, at);
     copy(l->quote, sizeof l->quote, quote);
@@ -600,12 +601,13 @@ static char status_char(const char *word)
     return strcmp(word, "away") == 0 ? 'a' : strcmp(word, "busy") == 0 ? 'b' : strcmp(word, "dnd") == 0 ? 'd' : 0;
 }
 
-static void side_add_user(const char *nick, const char *status, const char *text)
+static void side_add_user(const char *nick, const char *shown, const char *status, const char *text)
 {
     lc_side *s;
     side_add(LC_SIDE_USER, 0, nick, nick);
     if (M.nside == 0 || M.side[M.nside - 1].kind != LC_SIDE_USER) return;
     s = &M.side[M.nside - 1];
+    clean(s->shown, sizeof s->shown, shown);
     s->status = status_char(status);
     clean(s->note, sizeof s->note, text);
 }
@@ -629,13 +631,14 @@ static void switch_tab(int users)
 static void load_sidebar(void)
 {
     char *f[AE_CHAT_ROW_FIELDS];
-    char users[16][24], ustat[16][8], utext[16][28];
+    char users[16][24], ushown[16][24], ustat[16][8], utext[16][28];
     int nusers = 0, i, j, k, nord, ord[ROOMS_MAX], keep = M.side_sel;
     if (room_id[0] != '\0' && ae_chat_who(&chat) == AE_CHAT_OK) {
-        while (ae_chat_next_row(&chat, f, AE_CHAT_ROW_FIELDS) >= 2) {     /* user|room|sysop|roleColor|idle */
+        while ((k = ae_chat_next_row(&chat, f, AE_CHAT_ROW_FIELDS)) >= 2) {     /* user|room|sysop|roleColor|idle */
             if (strcmp(f[1], room_id) == 0 && nusers < 16) {
                 clean(ustat[nusers], sizeof ustat[0], f[5]);
                 clean(utext[nusers], sizeof utext[0], f[6]);
+                clean(ushown[nusers], sizeof ushown[0], k >= 8 ? f[7] : "");   /* WHO index 7: the hub's label */
                 clean(users[nusers++], sizeof users[0], f[0]);
             }
         }
@@ -644,10 +647,11 @@ static void load_sidebar(void)
     if (M.side_tab) {                       /* TS users tab: everyone online, not just this room */
         side_add(LC_SIDE_HEAD, 0, "ONLINE USERS", "");
         if (ae_chat_who(&chat) == AE_CHAT_OK) {
-            while (ae_chat_next_row(&chat, f, AE_CHAT_ROW_FIELDS) >= 2) {
-                char nm[24];
+            while ((k = ae_chat_next_row(&chat, f, AE_CHAT_ROW_FIELDS)) >= 2) {
+                char nm[24], sh[24];
                 clean(nm, sizeof nm, f[0]);
-                side_add_user(nm, f[5], f[6]);
+                clean(sh, sizeof sh, k >= 8 ? f[7] : "");
+                side_add_user(nm, sh, f[5], f[6]);
             }
         }
         M.side_sel = 0;
@@ -668,7 +672,7 @@ static void load_sidebar(void)
         M.side[M.nside - 1].art = strcmp(rooms_kind[i], "art") == 0;
         M.side[M.nside - 1].open = (char)open;
         M.side[M.nside - 1].unread = room_unread(rooms_id[i]);
-        if (here && open) for (j = 0; j < nusers; j++) side_add_user(users[j], ustat[j], utext[j]);
+        if (here && open) for (j = 0; j < nusers; j++) side_add_user(users[j], ushown[j], ustat[j], utext[j]);
     }
     if (ae_chat_dm_list(&chat) == AE_CHAT_OK) {
         int first = 1;
@@ -706,7 +710,7 @@ static int load_rooms(void)
 
 /* ---- events ------------------------------------------------------------- */
 
-static void side_user(const char *user, int add)
+static void side_user(const char *user, const char *shown, int add)
 {
     int i, j;
     for (i = 0; i < M.nside; i++) {
@@ -727,6 +731,7 @@ static void side_user(const char *user, int add)
             M.side[i + 1].kind = LC_SIDE_USER;
             clean(M.side[i + 1].label, sizeof M.side[i + 1].label, user);
             clean(M.side[i + 1].id, sizeof M.side[i + 1].id, user);
+            clean(M.side[i + 1].shown, sizeof M.side[i + 1].shown, shown);
             return;
         }
     }
@@ -972,40 +977,41 @@ static void take_events(void)
     char *f[AE_CHAT_ROW_FIELDS];
     char line[LC_TEXT_MAX];
     char reacted[8][24];       /* messages whose counts changed; fetched after the rows, which share the reply buffer */
-    int nreacted = 0, i;
-    while (ae_chat_next_row(&chat, f, AE_CHAT_ROW_FIELDS) >= AE_CHAT_ROW_MIN) {
+    int nreacted = 0, i, k;
+    while ((k = ae_chat_next_row(&chat, f, AE_CHAT_ROW_FIELDS)) >= AE_CHAT_ROW_MIN) {
         long seq = atol(f[0]);
         const char *type = f[1], *room = f[2], *user = f[3], *ref = f[4];
+        const char *shown = k >= 10 && f[9][0] != '\0' ? f[9] : user;   /* EVENTS index 9: the hub's label; identity stays `user` */
         int in_room = dm_thread[0] == '\0' && room_id[0] != '\0' && strcmp(room, room_id) == 0;
         if (event_hidden(type)) continue;
         if (strcmp(type, "message") == 0 && in_room) {
-            add_message(LC_LIVE, seq, ref, user, f[5], f[7], f[8]);
+            add_message(LC_LIVE, seq, ref, user, k >= 10 ? f[9] : "", f[5], f[7], f[8]);
         } else if (strcmp(type, "dm") == 0) {
             /* the hub's label column is the bare thread id: "dm<hex>" 1:1, "dg<hex>" group */
             if (dm_thread[0] != '\0' && strcmp(room, dm_thread) == 0) {
-                add_message(LC_LIVE, seq, ref, user, f[5], f[7], "");
+                add_message(LC_LIVE, seq, ref, user, k >= 10 ? f[9] : "", f[5], f[7], "");
             } else if (!is_self(user) && !hidden_nick(user)) {
                 /* TS chat:dm received: the DM line, then the activity line (group threads are "dg...") */
                 int group = strncmp(room, "dg", 2) == 0;
-                dm_line(0, group, user, f[7]);
-                sprintf(line, "%s from %.24s", group ? "Group DM" : "DM", user);
+                dm_line(0, group, shown, f[7]);
+                sprintf(line, "%s from %.24s", group ? "Group DM" : "DM", shown);
                 add_note(LC_ACTIVITY_LINE, line);
             }
         } else if ((strcmp(type, "react") == 0 || strcmp(type, "unreact") == 0) && in_room) {
             /* TS chat-socket-handlers chat:reaction: an accent chat line and an activity line */
-            sprintf(line, "[%.24s %s %.12s]", user, type[0] == 'u' ? "removed" : "reacted", f[7]);
+            sprintf(line, "[%.24s %s %.12s]", shown, type[0] == 'u' ? "removed" : "reacted", f[7]);
             add_note(LC_NOTE, line);
-            sprintf(line, "%.24s: %.12s", user, f[7]);
+            sprintf(line, "%.24s: %.12s", shown, f[7]);
             add_note(LC_ACTIVITY_LINE, line);
             for (i = 0; i < nreacted && strcmp(reacted[i], ref) != 0; i++) {}
             if (i == nreacted && nreacted < 8 && line_by_id(ref) != 0) clean(reacted[nreacted++], sizeof reacted[0], ref);
         } else if ((strcmp(type, "joined") == 0 || strcmp(type, "left") == 0) && in_room) {
             int joined = type[0] == 'j';
-            sprintf(line, "%.24s %s the room", user, joined ? "joined" : "left");
+            sprintf(line, "%.24s %s the room", shown, joined ? "joined" : "left");
             system_line(line);
-            sprintf(line, "%.24s %s", user, joined ? "joined" : "left");
+            sprintf(line, "%.24s %s", shown, joined ? "joined" : "left");
             add_note(LC_ACTIVITY_LINE, line);
-            if (!is_self(user)) side_user(user, joined);
+            if (!is_self(user)) side_user(user, k >= 10 ? f[9] : "", joined);
         } else if (strcmp(type, "presence") == 0) {
             side_presence(user, f[7]);          /* TS chat:presence: the dot and the text change in the user list */
         } else if (strcmp(type, "edit") == 0) {
@@ -1016,7 +1022,7 @@ static void take_events(void)
         } else if (strcmp(type, "topic") == 0 && in_room) {
             clean(room_topic, sizeof room_topic, f[7]);
             sprintf(M.pane_label, "%.40s - %.50s", room_name, room_topic);
-            sprintf(line, "%.24s set the topic: %.200s", user[0] != '\0' ? user : "Someone", room_topic);
+            sprintf(line, "%.24s set the topic: %.200s", shown[0] != '\0' ? shown : "Someone", room_topic);
             system_line(line);
         } else if (strcmp(type, "room_motd") == 0 && in_room) {
             /* TS room:motd: cache it, then "[MOTD] x" or "[MOTD] cleared" */
@@ -1123,10 +1129,10 @@ static void take_history(void)
 {
     char *f[AE_CHAT_ROW_FIELDS];
     char note[48];
-    int marker = M.nlines, n = 0;
+    int marker = M.nlines, n = 0, k;
     system_line("--- 0 earlier messages ---");
-    while (ae_chat_next_row(&chat, f, AE_CHAT_ROW_FIELDS) >= AE_CHAT_ROW_MIN) {
-        if (add_message(LC_HISTORY, atol(f[0]), f[1], f[2], f[3], f[7], f[4]) != 0) n++;
+    while ((k = ae_chat_next_row(&chat, f, AE_CHAT_ROW_FIELDS)) >= AE_CHAT_ROW_MIN) {
+        if (add_message(LC_HISTORY, atol(f[0]), f[1], f[2], k >= 9 ? f[8] : "", f[3], f[7], f[4]) != 0) n++;
     }
     if (n == 0) {                                  /* nothing earlier: no marker */
         int i;
@@ -1363,11 +1369,11 @@ static void list_who(void)
 {
     char *f[AE_CHAT_ROW_FIELDS];
     char line[128];
-    int rc = ae_chat_who(&chat), n = 0;
+    int rc = ae_chat_who(&chat), n = 0, k;
     if (rc != AE_CHAT_OK) { show_error(rc); return; }
     system_line("Who is on");
-    while (ae_chat_next_row(&chat, f, AE_CHAT_ROW_FIELDS) >= 5) {
-        sprintf(line, "%.24s in #%.24s%s, idle %ds", f[0], f[1], atoi(f[2]) ? " (sysop)" : "", atoi(f[4]));
+    while ((k = ae_chat_next_row(&chat, f, AE_CHAT_ROW_FIELDS)) >= 5) {
+        sprintf(line, "%.24s in #%.24s%s, idle %ds", k >= 8 && f[7][0] != '\0' ? f[7] : f[0], f[1], atoi(f[2]) ? " (sysop)" : "", atoi(f[4]));
         system_line(line);
         n++;
     }
@@ -2322,6 +2328,24 @@ static void motd_typed(const char *rest)
     then_poll(ae_chat_room_motd(&chat, room_id, strcmp(rest, "--clear") == 0 ? "" : rest));
 }
 
+/** /discord [on|off]: whether this board's chat is mirrored to Discord. No argument shows it; on/off is sysop only. */
+static void discord_typed(const char *rest)
+{
+    char arg[8];
+    int on = 0, rc;
+    arg_word(rest, arg, sizeof arg);
+    if (arg[0] == '\0') rc = ae_chat_discord(&chat, &on);
+    else if (strcmp(arg, "on") != 0 && strcmp(arg, "off") != 0) { system_line("Usage: /discord [on|off]"); return; }
+    else if (!is_sysop) { system_line("Only the sysop can change the Discord mirror."); return; }
+    else rc = ae_chat_discord_set(&chat, arg[1] == 'n', &on);
+    if (rc != AE_CHAT_OK) {
+        if (strcmp(chat.error, "forbidden") == 0) system_line("Only the sysop can change the Discord mirror.");
+        else show_error(rc);
+        return;
+    }
+    system_line(on ? "Discord mirror is ON for this board." : "Discord mirror is OFF for this board.");
+}
+
 /** /mode <+modes> [param ...]: TS commands/mode.ts; the hub applies it as web/backend mode.handler.ts.
  * Each per-flag refusal is a TS room:error modal, shown one after another. */
 static void mode_typed(const char *rest)
@@ -2471,12 +2495,12 @@ static void thread_view(const char *msg_id)
     char *f[AE_CHAT_ROW_FIELDS];
     char t[LC_VIEW_COL + 40], rows[LC_VIEW_MAX / 2][LC_VIEW_COL];
     char first[LC_VIEW_COL], when[8];
-    int n = 0, i, rc = ae_chat_thread_list(&chat, msg_id, 30);
+    int n = 0, i, k, rc = ae_chat_thread_list(&chat, msg_id, 30);
     if (rc != AE_CHAT_OK) { show_error(rc); return; }
     first[0] = '\0';
-    while (ae_chat_next_row(&chat, f, AE_CHAT_ROW_FIELDS) >= AE_CHAT_ROW_MIN) {
-        if (first[0] == '\0') { hhmm_of(when, f[3]); sprintf(first, "%.24s: %.60s", f[2], f[7]); }
-        else if (n < LC_VIEW_MAX / 2) { sprintf(rows[n], "%.24s: %.60s", f[2], f[7]); n++; }
+    while ((k = ae_chat_next_row(&chat, f, AE_CHAT_ROW_FIELDS)) >= AE_CHAT_ROW_MIN) {
+        if (first[0] == '\0') { hhmm_of(when, f[3]); sprintf(first, "%.24s: %.60s", k >= 9 && f[8][0] != '\0' ? f[8] : f[2], f[7]); }
+        else if (n < LC_VIEW_MAX / 2) { sprintf(rows[n], "%.24s: %.60s", k >= 9 && f[8][0] != '\0' ? f[8] : f[2], f[7]); n++; }
     }
     if (first[0] == '\0') { system_line("Not found."); return; }
     view_open("Thread");
@@ -2603,6 +2627,7 @@ static int run_command(const char *line)
     if (is_cmd(cmd, "pinned", "pins")) { pinned_typed(); return 0; }
     if (is_cmd(cmd, "search", "find")) { search_open(); return 0; }
     if (strcmp(cmd, "motd") == 0) { motd_typed(rest); return 0; }
+    if (strcmp(cmd, "discord") == 0) { discord_typed(rest); return 0; }
     if (strcmp(cmd, "mode") == 0) { mode_typed(rest); return 0; }
     if (strcmp(cmd, "emoji") == 0 && *rest == '\0') { emoji_show(); return 0; }   /* commands/emoji.ts: no query opens the picker */
     if (strcmp(cmd, "emoji") == 0) { emoji_search_typed(rest); return 0; }

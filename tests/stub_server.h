@@ -105,6 +105,7 @@ typedef struct {
     char emoji_body[120];                  /* body of the latest PUT /emoji/:name */
     char room_motd[128];                   /* the room's motd: PUT /rooms/:id/motd sets it, the join reply carries it */
     volatile int room_motd_puts;
+    volatile int discord_on;               /* GET/PUT /chat/v1/discord */
     volatile int mode_calls;               /* POST /rooms/:id/mode */
     volatile int typing_calls;             /* POST /rooms/:id/typing (D3) */
     char typing_log[600];                  /* every typing text sent, each followed by '|' */

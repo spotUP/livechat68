@@ -285,6 +285,18 @@ static void test_client(void)
     /* A field the server appended later is dropped, not folded into the last field a narrower caller reads. */
     assert(ae_chat_history(&c, "lobby", 0, 20) == AE_CHAT_OK);
     assert(ae_chat_next_row(&c, f, 6) == 8 && strcmp(f[5], "m1") == 0);
+    /* The hub's appended label (history index 8) reaches the caller; a row without it reads "". */
+    assert(ae_chat_history(&c, "lobby", 0, 20) == AE_CHAT_OK);
+    assert(ae_chat_next_row(&c, f, AE_CHAT_ROW_FIELDS) == 8 && f[8][0] == '\0');
+    assert(ae_chat_next_row(&c, f, AE_CHAT_ROW_FIELDS) == 9 && strcmp(f[2], "bob") == 0 && strcmp(f[8], "bob") == 0);
+    {   /* GET/PUT /discord */
+        int on = 1;
+        assert(ae_chat_discord(&c, &on) == AE_CHAT_OK && on == 0);
+        assert(ae_chat_discord_set(&c, 1, &on) == AE_CHAT_OK && on == 1);
+        assert(strcmp(st->last_write_path, "/chat/v1/discord") == 0 && strcmp(st->last_write_body, "{\"on\":true}") == 0);
+        assert(ae_chat_discord(&c, &on) == AE_CHAT_OK && on == 1);
+        assert(ae_chat_discord_set(&c, 0, &on) == AE_CHAT_OK && on == 0);
+    }
 
     assert(ae_chat_send(&c, "lobby", "hi", 0, 0) == AE_CHAT_OK && strcmp(st->last_message, "hi") == 0);
     assert(ae_chat_poll(&c, 0) == AE_CHAT_OK);

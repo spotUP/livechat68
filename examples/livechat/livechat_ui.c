@@ -607,12 +607,12 @@ void lc_line_marked(const lc_line *l, char *out, int cap, int stamps, int width)
     case LC_HISTORY:                                  /* [hh:mm] <nick> text */
         if (stamps) { sb_fg(&b, LC_DIM); sb_ch(&b, '['); sb_str(&b, l->time); sb_str(&b, "] "); sb_ch(&b, UI_CELLS_M_BASE); }
         sb_str(&b, "<");
-        sb_fg(&b, lc_nick_color(l->nick)); sb_str(&b, l->nick);
+        sb_fg(&b, lc_nick_color(l->nick)); sb_str(&b, l->label[0] != '\0' ? l->label : l->nick);
         sb_ch(&b, UI_CELLS_M_BASE); sb_str(&b, "> "); sb_markdown(&b, l->text);
         break;
     default:                                          /* [hh:mm] nick: text, nick bold */
         if (stamps) { sb_fg(&b, LC_DIM); sb_ch(&b, '['); sb_str(&b, l->time); sb_str(&b, "] "); sb_ch(&b, UI_CELLS_M_BASE); }
-        sb_fg(&b, lc_nick_color(l->nick)); sb_ch(&b, UI_CELLS_M_BOLD); sb_str(&b, l->nick);
+        sb_fg(&b, lc_nick_color(l->nick)); sb_ch(&b, UI_CELLS_M_BOLD); sb_str(&b, l->label[0] != '\0' ? l->label : l->nick);
         sb_ch(&b, UI_CELLS_M_BASE); sb_str(&b, ": "); sb_markdown(&b, l->text);
         break;
     }
@@ -621,7 +621,7 @@ void lc_line_marked(const lc_line *l, char *out, int cap, int stamps, int width)
     }
     if (l->kind == LC_HISTORY || l->kind == LC_LIVE) {   /* counts on their own rows under it (sysop 2026-11-08) */
         char rows[LC_REACT_MAX * 40];
-        indent += (int)strlen(l->nick) + (l->kind == LC_HISTORY ? 3 : 2);   /* "<nick> " or "nick: " */
+        indent += (int)strlen(l->label[0] != '\0' ? l->label : l->nick) + (l->kind == LC_HISTORY ? 3 : 2);   /* "<nick> " or "nick: " */
         lc_react_rows(l, indent, width, rows, (int)sizeof rows);
         if (rows[0] != '\0') { sb_ch(&b, UI_CELLS_M_BASE); sb_fg(&b, LC_ACCENT); sb_str(&b, rows); }
     }
@@ -667,8 +667,9 @@ static void draw_side_item(ui_cells *c, const lc_side *s, int row, int width, in
     }
     case LC_SIDE_USER: {                   /* TS user-status marks: [*] online, [~] away, [-] do not disturb; [!] busy */
         const char *dot = s->status == 'a' ? "[~]" : s->status == 'b' ? "[!]" : s->status == 'd' ? "[-]" : "[*]";
-        if (s->note[0] != '\0') sprintf(buf, "%s  \001%c%s\004 %.20s: %.14s", mark, (char)LC_DIM, dot, s->label, s->note);
-        else sprintf(buf, "%s  \001%c%s\004 %.38s", mark, (char)LC_DIM, dot, s->label);
+        const char *name = s->shown[0] != '\0' ? s->shown : s->label;
+        if (s->note[0] != '\0') sprintf(buf, "%s  \001%c%s\004 %.20s: %.14s", mark, (char)LC_DIM, dot, name, s->note);
+        else sprintf(buf, "%s  \001%c%s\004 %.38s", mark, (char)LC_DIM, dot, name);
         break;
     }
     case LC_SIDE_DM: sprintf(buf, "%s@ %.38s", mark, s->label); break;
@@ -933,6 +934,7 @@ const char *const lc_cmd_help[][4] = {
     {"customemoji", "", "Add, remove or list the board's custom emoji (sysop adds)", "/customemoji add <name> <display> <ascii> | remove <name> | list"},
     {"events", "", "Manage BBS event display preferences", "/events [on|off|logins|files|doors|messages|announcements]"},
     {"mic", "", "List microphones, or switch to one", "/mic [number]"},
+    {"discord", "", "Show or switch the Discord mirror of this board's chat (sysop switches)", "/discord [on|off]"},
     {"motd", "", "Set channel MOTD (moderator only; --clear to clear; no args = show current)", "/motd [text]  (use /motd --clear to clear)"},
     {"mode", "", "Set channel or user modes (+i/+m/+o/+v/-X). Moderator only.", "/mode <modes> [param]"},
     {"me", "", "Send an action message", "/me does something"},

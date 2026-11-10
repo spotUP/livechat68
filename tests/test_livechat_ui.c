@@ -405,7 +405,7 @@ static int slash_menu_rules(void)
     n = lc_slash_match("/mute", idx, LC_SLASH_MAX);          /* prefix first (mute), then description matches (unmute: "Unmute user") */
     if (n < 2 || strcmp(lc_cmd_help[idx[0]][0], "mute") != 0 || strcmp(lc_cmd_help[idx[1]][0], "deafen") != 0) { printf("slash: /mute order\n"); fail = 1; }
     n = lc_slash_match("/pin", idx, LC_SLASH_MAX);            /* a TS command the door does not run yet is still listed */
-    if (n < 3 || strcmp(lc_cmd_help[idx[0]][0], "pin") != 0 || strcmp(lc_cmd_help[idx[1]][0], "pinned") != 0 || lc_cmd_help_count != 56) { printf("slash: /pin n=%d count=%d\n", n, lc_cmd_help_count); fail = 1; }
+    if (n < 3 || strcmp(lc_cmd_help[idx[0]][0], "pin") != 0 || strcmp(lc_cmd_help[idx[1]][0], "pinned") != 0 || lc_cmd_help_count != 57) { printf("slash: /pin n=%d count=%d\n", n, lc_cmd_help_count); fail = 1; }
     n = lc_slash_match("/reaction", idx, LC_SLASH_MAX);
     if (n < 1 || strcmp(lc_cmd_help[idx[0]][0], "reactions") != 0) { printf("slash: /reaction first\n"); fail = 1; }
     n = lc_slash_match("/Away", idx, LC_SLASH_MAX);

@@ -507,6 +507,10 @@ static void chat_serve(int fd, stub_chat_stats *st, int *state)
             }
             chat_reply(fd, 200, "application/json", "{\"ok\":true}");
         }
+    } else if (strcmp(path, "/chat/v1/discord") == 0) {
+        chat_note_write(st, path, body);
+        if (!is_get) st->discord_on = body != 0 && strstr(body, "\"on\":true") != 0;
+        chat_reply(fd, 200, "application/json", st->discord_on ? "{\"on\":true}" : "{\"on\":false}");
     } else if (strcmp(path, "/chat/v1/motd") == 0) {
         chat_note_write(st, path, body);
         if (is_get) chat_reply(fd, 200, "application/json", st->motd_set ? "{\"text\":\"Be nice\"}" : "{\"text\":\"\"}");
@@ -680,7 +684,7 @@ static void chat_serve(int fd, stub_chat_stats *st, int *state)
     } else if (is_get && strstr(path, "/rooms/") != 0 && strstr(path, "/history.txt") != 0) {
         st->histories++;
         chat_reply(fd, 200, "text/plain",
-                   "HISTORY|1|6|2\r\n1|m1|alice|1700000000||m1|9|hello there!bar\r\n2|m2|bob|1700000060|m1|m1|0|second line\r\n");
+                   "HISTORY|1|6|2\r\n1|m1|alice|1700000000||m1|9|hello there!bar\r\n2|m2|bob|1700000060|m1|m1|0|second line|bob\r\n");
     } else if (is_post && strstr(path, "/rooms/") != 0 && strstr(path, "/messages") != 0) {
         st->messages++;
         chat_note_write(st, path, body);

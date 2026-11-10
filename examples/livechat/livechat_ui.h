@@ -96,6 +96,7 @@ typedef struct {
     char id[24];           /* server message id, "" for local lines */
     char time[6];          /* "hh:mm" */
     char nick[24];
+    char label[24];        /* the hub's display name (bare handle, or handle@BOARD on a clash); "" = show nick */
     char text[LC_TEXT_MAX];
     lc_react react[LC_REACT_MAX];
     int nreact;
@@ -114,6 +115,7 @@ typedef struct {
     int joined;            /* rooms: the caller is in it */
     char label[40];
     char id[48];           /* room id, DM thread id, or user handle */
+    char shown[40];        /* users: the hub's display name; "" = show label */
     char status;           /* users: 0 online, 'a' away, 'b' busy, 'd' do not disturb */
     char note[28];         /* users: the status text (the away message) */
     char art;              /* rooms: 1 for an Art room, marked [A] as the TS sidebar does */
