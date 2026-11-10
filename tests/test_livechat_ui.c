@@ -495,9 +495,66 @@ static int format_picker_model(void)
     return fail;
 }
 
+/* The theme menu's name column is the longest name plus one, so no name pushes its blurb out of line. */
+static int theme_menu_columns(void)
+{
+    ui_cells c;
+    lc_model *m = (lc_model *)malloc(sizeof *m);
+    int cr, cc, n = ui_theme_count(), i, longest = 0, shortest = 0, col_long = -1, col_short = -1, r, k, bad = 0;
+    static char row[100];
+    for (i = 0; i < n; i++) {
+        if (strlen(ui_theme_at(i)->name) > strlen(ui_theme_at(longest)->name)) longest = i;
+        if (strlen(ui_theme_at(i)->name) < strlen(ui_theme_at(shortest)->name)) shortest = i;
+    }
+    ui_cells_open(&c, 80, 25);
+    main_state(m, 80, 25);
+    m->theme = 1;
+    lc_draw(&c, m, &cr, &cc);
+    for (r = 0; r < 50; r++) {      /* two passes: the longest name's row may come after the shortest's */
+        for (k = 0; k < 80; k++) row[k] = c.back[(r % 25) * 80 + k].ch ? (char)c.back[(r % 25) * 80 + k].ch : ' ';
+        row[80] = '\0';
+        {
+            const char *a = strstr(row, ui_theme_at(longest)->name), *b = strstr(row, ui_theme_at(shortest)->name);
+            if (a != 0 && col_long < 0) col_long = (int)(a - row) + (int)strlen(ui_theme_at(longest)->name) + 1;
+            if (b != 0 && col_short < 0 && col_long >= 0 && b == row + (col_long - 1 - (int)strlen(ui_theme_at(longest)->name)) && row[col_long] == ui_theme_at(shortest)->blurb[0]) col_short = col_long;
+            if (a != 0 && row[col_long] != ui_theme_at(longest)->blurb[0]) bad = 1;
+        }
+    }
+    free(m);
+    if (col_long < 0 || bad || col_long != col_short) { printf("FAIL theme menu name column long=%d short=%d bad=%d\n", col_long, col_short, bad); return 1; }
+    return 0;
+}
+
+/* lc_theme_set maps every theme token to the same xterm index the TS door's blessed match() answers
+ * (tests/fixtures/lc68-ts-colour-map.txt, generated from engines/ui/blessed/core/colors.ts). The default ink
+ * #E4ECFA is grey 255, not the cyan-tinted cube 195. */
+static int colours_match_ts(void)
+{
+    FILE *f = fopen("tests/fixtures/lc68-ts-colour-map.txt", "r");
+    char line[256];
+    int bad = 0, rows = 0;
+    if (f == 0) { printf("FAIL cannot read colour map\n"); return 1; }
+    while (fgets(line, sizeof line, f) != 0) {
+        int idx, v[UI_TOKEN_COUNT], t, off = 0, used;
+        if (line[0] == '#') continue;
+        if (sscanf(line, "%d%n", &idx, &used) != 1) continue;
+        off = used;
+        for (t = 0; t < UI_TOKEN_COUNT; t++) { sscanf(line + off, "%d%n", &v[t], &used); off += used; }
+        lc_theme_set(ui_theme_at(idx)->rgb);
+        for (t = 0; t < UI_TOKEN_COUNT; t++)
+            if (lc_col[t] != v[t]) { printf("FAIL theme %d token %d: C %d, TS %d\n", idx, t, lc_col[t], v[t]); bad = 1; }
+        rows++;
+    }
+    fclose(f);
+    lc_theme_set(ui_theme_at(0)->rgb);
+    if (rows != ui_theme_count()) { printf("FAIL colour map has %d rows, %d themes\n", rows, ui_theme_count()); bad = 1; }
+    if (lc_col[UI_T_INK] != 255) { printf("FAIL default ink %d, want 255\n", lc_col[UI_T_INK]); bad = 1; }
+    return bad;
+}
+
 int main(void)
 {
-    int r = chat_cache_and_pane_fill() | react_rows_under_the_message() | stamps_follow_the_pref() | active_panel_is_highlighted() | picker_selects_and_draws() | slash_menu_rules() | message_formatting() | event_line_marks() | system_line_tone() | format_picker_model();
+    int r = chat_cache_and_pane_fill() | react_rows_under_the_message() | stamps_follow_the_pref() | active_panel_is_highlighted() | picker_selects_and_draws() | slash_menu_rules() | message_formatting() | event_line_marks() | system_line_tone() | format_picker_model() | theme_menu_columns() | colours_match_ts();
     int a = compare("tests/fixtures/lc68-ts-main-80x25.grid");
     int b = compare("tests/fixtures/lc68-ts-main-40x25.grid");
     int d = compare("tests/fixtures/lc68-ts-main-80x15.grid");

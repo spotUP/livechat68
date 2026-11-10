@@ -63,6 +63,11 @@ extern "C" {
 #define AE_KEY_F5          0x85
 #define AE_KEY_F6          0x86
 #define AE_KEY_F7          0x87
+/* F1-F4 followed (the board maps every F1-F7 terminal spelling to these bytes). */
+#define AE_KEY_F1          0x88
+#define AE_KEY_F2          0x89
+#define AE_KEY_F3          0x8a
+#define AE_KEY_F4          0x8b
 
 #define UI_KEY_UP    1000
 #define UI_KEY_DOWN  1001

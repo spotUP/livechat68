@@ -16,6 +16,7 @@
 #include <arpa/inet.h>
 #include <sys/mman.h>
 #include <signal.h>
+#include <poll.h>
 #include "stub_server.h"
 
 /* How long stub_server_start_sequence()'s child waits for EACH connection
@@ -703,6 +704,11 @@ static void chat_serve(int fd, stub_chat_stats *st, int *state)
     } else if (is_post && strstr(path, "/thread") != 0) {
         st->threads++;
         chat_reply(fd, 200, "application/json", "{\"id\":\"t1\",\"seq\":9}");
+    } else if (is_post && st->dm_unknown[0] != '\0'
+               && (strcmp(path, "/chat/v1/dm-group") == 0 || strncmp(path, "/chat/v1/dm/", 12) == 0)) {
+        char reply[160];
+        sprintf(reply, "{\"error\":\"not_found\",\"detail\":\"unknown user: %.100s\"}", st->dm_unknown);
+        chat_reply(fd, 404, "application/json", reply);
     } else if (is_post && strcmp(path, "/chat/v1/dm-group") == 0) {
         st->group_dms++;
         strncpy(st->last_group_body, body, sizeof st->last_group_body - 1);
@@ -776,19 +782,26 @@ static void chat_serve(int fd, stub_chat_stats *st, int *state)
 int stub_chat_start(stub_chat_stats **stats, int *out_pid)
 {
     int listen_fd, port;
-    pid_t pid;
+    pid_t pid, parent;
     stub_chat_stats *st = mmap(0, sizeof *st, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
     if (st == MAP_FAILED) return -1;
     memset(st, 0, sizeof *st);
     listen_fd = make_listener(&port);
     if (listen_fd < 0) return -1;
     if (listen(listen_fd, 8) != 0) { close(listen_fd); return -1; }
+    parent = getpid();
     pid = fork();
     if (pid < 0) { close(listen_fd); return -1; }
     if (pid == 0) {
         int state = 0;
         for (;;) {
-            int fd = accept(listen_fd, 0, 0);
+            int fd;
+            struct pollfd pf;
+            pf.fd = listen_fd; pf.events = POLLIN; pf.revents = 0;
+            /* The test process can die without calling stub_chat_stop (a failed assert aborts it):
+               a stub that outlived it was reparented to init and ran forever. Check every 200 ms. */
+            if (poll(&pf, 1, 200) <= 0) { if (getppid() != parent) _exit(0); continue; }
+            fd = accept(listen_fd, 0, 0);
             if (fd < 0) continue;
             chat_serve(fd, st, &state);
             close(fd);

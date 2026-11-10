@@ -142,6 +142,30 @@ static void clean(char *dst, size_t cap, const char *src)
         unsigned char ch = (unsigned char)*src;
         dst[n++] = (ch < 32 || ch == 127) ? ' ' : (char)ch;
     }
+    /* Cut short: never leave half a UTF-8 sequence or half a {colour} / ~effect~ tag at the end. */
+    if (*src != '\0') {
+        size_t k = n, floor = n > 40 ? n - 40 : 0;
+        while (k > floor && dst[k - 1] != '{' && dst[k - 1] != '}') k--;           /* an unclosed {tag} */
+        if (k > floor && dst[k - 1] == '{') n = k - 1;
+        else {
+            size_t t = n;
+            while (t > floor && (dst[t - 1] == '-' || (dst[t - 1] >= 'a' && dst[t - 1] <= 'z') || (dst[t - 1] >= '0' && dst[t - 1] <= '9'))) t--;
+            if (t > floor && dst[t - 1] == '~') {
+                size_t open = 0, i;
+                for (i = 0; i < t; i++) if (dst[i] == '~') open++;
+                if (open % 2 == 1) n = t - 1;                                       /* an unclosed ~effect */
+            }
+        }
+        {
+            size_t lead = n;
+            while (lead > 0 && n - lead < 4 && ((unsigned char)dst[lead - 1] & 0xC0) == 0x80) lead--;   /* continuation bytes */
+            if (lead > 0 && n - lead < 4) {
+                unsigned char b = (unsigned char)dst[lead - 1];
+                size_t want = b >= 0xF0 ? 4 : b >= 0xE0 ? 3 : b >= 0xC0 ? 2 : 1;
+                if (want > 1 && n - (lead - 1) < want) n = lead - 1;
+            }
+        }
+    }
     dst[n] = '\0';
 }
 
@@ -2471,6 +2495,19 @@ static void thread_view(const char *msg_id)
     view_add("Press ESC to close");
 }
 
+/** A DM the hub refused. not_found (404 "unknown user: a, b") is the TS door's system line
+    `User <name> not found`, not a modal; anything else is show_error. `who` is the typed 1:1 target; empty (group DM) takes the names from the hub's detail. */
+static void dm_error(int rc, const char *who)
+{
+    char line[160];
+    if (rc == AE_CHAT_ERR_STATUS && strcmp(chat.error, "not_found") == 0) {
+        const char *names = who;
+        if (who[0] == '\0' && strncmp(chat.detail, "unknown user: ", 14) == 0 && chat.detail[14] != '\0') names = chat.detail + 14;
+        sprintf(line, "User %.100s not found", names);
+        system_line(line);
+    } else show_error(rc);
+}
+
 /** Runs one "/..." line. Returns 1 when the door should end. */
 static void emoji_show(void);
 static int run_command(const char *line)
@@ -2530,7 +2567,7 @@ static int run_command(const char *line)
         if (n == 0 || *rest == '\0') { system_line("Usage: /msg @user [@user2 ...] message"); return 0; }
         rc = n == 1 ? ae_chat_dm(&chat, peers[0], rest, tid, sizeof tid)
                     : ae_chat_dm_group(&chat, peers, n, rest, tid, sizeof tid);
-        if (rc != AE_CHAT_OK) { show_error(rc); return 0; }
+        if (rc != AE_CHAT_OK) { dm_error(rc, n == 1 ? targets[0] : ""); return 0; }
         if (n == 1 && dm_thread[0] != '\0' && strcmp(peers[0], dm_peer) == 0) { do_poll(); return 0; }
         list[0] = '\0';
         for (i = 0; i < n; i++) {
@@ -2597,7 +2634,7 @@ static int submit(void)
     } else if (dm_thread[0] != '\0') {
         char tid[32];
         rc = ae_chat_dm(&chat, dm_peer, M.input, tid, sizeof tid);
-        if (rc == AE_CHAT_OK) do_poll(); else show_error(rc);
+        if (rc == AE_CHAT_OK) do_poll(); else dm_error(rc, dm_peer);
     } else if (room_id[0] != '\0') {
         send_room_line(M.input, 0);
     } else {

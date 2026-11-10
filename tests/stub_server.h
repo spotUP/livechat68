@@ -111,6 +111,7 @@ typedef struct {
     char last_write_path[128];             /* path of the latest edit, delete, topic, moderation or invite call */
     char last_write_body[300];             /* its JSON body ("" for DELETE) */
     char last_dm_peer[64];
+    char dm_unknown[96];      /* non-empty: DM and group DM answer 404 not_found "unknown user: <this>" */
     char last_dm_text[512];
     int group_dms;                         /* POST /chat/v1/dm-group */
     char session_user[48];                 /* test sets: the session's user name ("" = Tester) */

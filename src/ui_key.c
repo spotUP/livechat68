@@ -8,6 +8,60 @@
 
 #include "ui_key.h"
 
+/* Function key from the n of ESC [ n ~ (xterm/PuTTY/SyncTERM numbering). */
+static int fkey_from_vt(int n)
+{
+    switch (n) {
+    case 11: return UI_KEY_F1;
+    case 12: return UI_KEY_F2;
+    case 13: return UI_KEY_F3;
+    case 14: return UI_KEY_F4;
+    case 15: return UI_KEY_F5;
+    case 17: return UI_KEY_F6;
+    case 18: return UI_KEY_F7;
+    default: return 0;
+    }
+}
+
+/*
+ * Amiga 8-bit CSI (0x9B): console.device sends F1-F7 as 9B 0~ .. 9B 6~
+ * (Devices manual, "Special key report sequences"). Real AmiExpress hands a
+ * door the caller's bytes raw, so this arrives here from an Amiga terminal.
+ * The 7-bit ESC [ n ~ keeps the VT220 meaning; only the 8-bit form is Amiga.
+ * Arrows are A-D as in 7-bit CSI. Anything else is read whole and answered 0.
+ */
+static int ui_decode_amiga_csi(const ui_key_source *src)
+{
+    int c, n = -1;
+
+    for (;;) {
+        c = src->next(src->ctx);
+        if (c < 0) return c;
+        if (c >= '0' && c <= '9') { n = (n < 0 ? 0 : n * 10) + (c - '0'); continue; }
+        if (c == ';' || c == '?' || c == ' ') continue;
+        break;
+    }
+    switch (c) {
+    case 'A': return UI_KEY_UP;
+    case 'B': return UI_KEY_DOWN;
+    case 'C': return UI_KEY_RIGHT;
+    case 'D': return UI_KEY_LEFT;
+    case '~':
+        switch (n) {
+        case 0: return UI_KEY_F1;
+        case 1: return UI_KEY_F2;
+        case 2: return UI_KEY_F3;
+        case 3: return UI_KEY_F4;
+        case 4: return UI_KEY_F5;
+        case 5: return UI_KEY_F6;
+        case 6: return UI_KEY_F7;
+        default: return 0;
+        }
+    default:
+        return 0;
+    }
+}
+
 int ui_decode_escape(const ui_key_source *src, int *pushback)
 {
     int c;
@@ -66,6 +120,20 @@ int ui_decode_escape(const ui_key_source *src, int *pushback)
     case 'R': return UI_KEY_F3;
     case 'S': return UI_KEY_F4;
     case 'Z': return UI_KEY_BACKTAB;
+    case '[': {
+        /* linux console: ESC [ [ A..E are F1-F5. */
+        int f = src->next(src->ctx);
+        if (f < 0) return f;
+        switch (f) {
+        case 'A': return UI_KEY_F1;
+        case 'B': return UI_KEY_F2;
+        case 'C': return UI_KEY_F3;
+        case 'D': return UI_KEY_F4;
+        case 'E': return UI_KEY_F5;
+        default: break;
+        }
+        *pushback = f;
+        return 0; }
     case '5': case '6': case '1': case '4': case '3': {
         /* ESC [ n ~ : the tilde is part of the sequence. */
         int t = src->next(src->ctx);
@@ -98,12 +166,12 @@ int ui_decode_escape(const ui_key_source *src, int *pushback)
             }
         }
         if (c == '1' && t >= '0' && t <= '9') {
-            /* ESC [ 1 n ~ : F5 (15) and the other xterm function keys. Read the
-             * tilde too, or it is delivered as a typed '~'. */
+            /* ESC [ 1 n ~ : F1-F7 (11-15, 17, 18) and the other xterm function
+             * keys. Read the tilde too, or it is delivered as a typed '~'. */
             int fin = src->next(src->ctx);
             if (fin < 0) return fin;
             if (fin != '~') { *pushback = fin; return 0; }
-            return t == '5' ? UI_KEY_F5 : t == '7' ? UI_KEY_F6 : t == '8' ? UI_KEY_F7 : 0;
+            return fkey_from_vt(10 + (t - '0'));
         }
         if (c == '3') return UI_KEY_DELETE;
         if (c == '5') return UI_KEY_PGUP;
@@ -172,10 +240,15 @@ int ui_key_read(const ui_key_source *src, int *pushback)
     if (c == AE_KEY_F5)          return UI_KEY_F5;
     if (c == AE_KEY_F6)          return UI_KEY_F6;
     if (c == AE_KEY_F7)          return UI_KEY_F7;
+    if (c == AE_KEY_F1)          return UI_KEY_F1;
+    if (c == AE_KEY_F2)          return UI_KEY_F2;
+    if (c == AE_KEY_F3)          return UI_KEY_F3;
+    if (c == AE_KEY_F4)          return UI_KEY_F4;
 
     if (c == UI_MOUSE_WAKE) return UI_KEY_MOUSE;
 
     if (c == 0x1b) return ui_decode_escape(src, pushback);
+    if (c == 0x9b) return ui_decode_amiga_csi(src);
 
     return c;
 }

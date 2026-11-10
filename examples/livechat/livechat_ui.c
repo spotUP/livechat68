@@ -306,13 +306,41 @@ static int hex_digit(int ch)
     return ch >= '0' && ch <= '9' ? ch - '0' : ch >= 'a' && ch <= 'f' ? ch - 'a' + 10 : ch >= 'A' && ch <= 'F' ? ch - 'A' + 10 : -1;
 }
 
-/* 0xRRGGBB to the nearest xterm cube colour. */
+/* 0xRRGGBB to the nearest of the 256 xterm colours, exactly as the TS door's blessed layer does it
+ * (engines/ui/blessed/core/colors.ts match(): the sixteen system colours, the 6x6x6 cube, the 24-step grey
+ * ramp; weighted squared distance 30/59/11; the first nearest wins; an exact hit stops the search). */
+static const unsigned long sys16[16] = {
+    0x000000UL, 0xcd0000UL, 0x00cd00UL, 0xcdcd00UL, 0x0000eeUL, 0xcd00cdUL, 0x00cdcdUL, 0xe5e5e5UL,
+    0x7f7f7fUL, 0xff0000UL, 0x00ff00UL, 0xffff00UL, 0x5c5cffUL, 0xff00ffUL, 0x00ffffUL, 0xffffffUL
+};
+
+static unsigned long palette256(int i)
+{
+    int r, g, b, l;
+    if (i < 16) return sys16[i];
+    if (i < 232) {
+        i -= 16;
+        r = i / 36; g = (i / 6) % 6; b = i % 6;
+        return ((unsigned long)(r ? r * 40 + 55 : 0) << 16) | ((unsigned long)(g ? g * 40 + 55 : 0) << 8) | (unsigned long)(b ? b * 40 + 55 : 0);
+    }
+    l = (i - 232) * 10 + 8;
+    return ((unsigned long)l << 16) | ((unsigned long)l << 8) | (unsigned long)l;
+}
+
 static int rgb_cube(unsigned long rgb)
 {
-    int v[3], i;
-    v[0] = (int)((rgb >> 16) & 255); v[1] = (int)((rgb >> 8) & 255); v[2] = (int)(rgb & 255);
-    for (i = 0; i < 3; i++) v[i] = v[i] < 48 ? 0 : v[i] < 115 ? 1 : (v[i] - 35) / 40;
-    return 16 + 36 * v[0] + 6 * v[1] + v[2];
+    long best = 0x7fffffffL;
+    int i, li = 0;
+    for (i = 0; i < 256; i++) {
+        unsigned long p = palette256(i);
+        long dr = 30L * ((long)((rgb >> 16) & 255) - (long)((p >> 16) & 255));
+        long dg = 59L * ((long)((rgb >> 8) & 255) - (long)((p >> 8) & 255));
+        long db = 11L * ((long)(rgb & 255) - (long)(p & 255));
+        long d = dr * dr + dg * dg + db * db;
+        if (d == 0) return i;
+        if (d < best) { best = d; li = i; }
+    }
+    return li;
 }
 
 /* "#rrggbb" (the theme tokens the format picker writes, ui/format-picker.ts:21-28) to the nearest xterm cube colour. */
@@ -1522,12 +1550,24 @@ static void draw_settings(ui_cells *c, const lc_model *m)
 
 static int theme_first;                         /* the first theme row shown (the list scrolls to keep the highlight in view) */
 
-/* TS overlays/theme-menu.ts: a 54-wide panel labelled " Theme ", one row per theme ` name.padEnd(18) blurb`, the
+/* The name column: the longest theme name plus one space (TS theme-menu.ts computes the same from the table). */
+static int theme_name_col(void)
+{
+    int n = ui_theme_count(), i, best = 0;
+    for (i = 0; i < n; i++) {
+        int l = (int)strlen(ui_theme_at(i)->name);
+        if (l > best) best = l;
+    }
+    return best + 1;
+}
+
+/* TS overlays/theme-menu.ts: a 54-wide panel labelled " Theme ", one row per theme ` name.padEnd(col) blurb`, the
  * highlight in selection colours, and the help line on the interior's last row in the dim colour. */
 static void draw_theme(ui_cells *c, const lc_model *m)
 {
     int n = ui_theme_count(), h = n + 6 < 20 ? n + 6 : 20, w = 54, top, left, vis, i;
-    char t[96];
+    char t[160];
+    int namew = theme_name_col();
     ui_cells_pen(c, LC_INK, UI_CELLS_DEFAULT, 0);
     ui_cells_modal(c, h, w, LC_CHROME, " Theme ", LC_INK, &top, &left);
     ui_hit_add(&lc_hits, LC_HIT_THEME, top, left, h, w);
@@ -1537,7 +1577,7 @@ static void draw_theme(ui_cells *c, const lc_model *m)
     for (i = 0; i < vis; i++) {
         const ui_theme *th = ui_theme_at(theme_first + i);
         int sel = theme_first + i == m->theme_sel;
-        sprintf(t, " %-18s%s", th->name, th->blurb);
+        sprintf(t, " %-*s%s", namew, th->name, th->blurb);   /* ui_cells_text cuts the blurb at the row end */
         ui_cells_pen(c, sel ? LC_SEL_INK : LC_INK, sel ? LC_SEL_BG : UI_CELLS_DEFAULT, 0);
         ui_cells_fill(c, top + i, left, 1, w - 2, ' ');
         ui_cells_text(c, top + i, left, t, w - 2);

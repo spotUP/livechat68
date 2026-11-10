@@ -1079,6 +1079,16 @@ static void test_door_dm_and_group_dm(void)
     drive(KEYS("\r" "/msg @bob @bob hey\r"), 0);
     assert(M.modal == LC_MODAL_MESSAGE && strcmp(M.modal_text, "Group DM needs 3+ unique participants (use /msg for 1:1)") == 0);
     stop_stub();
+    start_stub();                                    /* hub 404 not_found: the TS system line, not a modal */
+    strcpy(st->dm_unknown, "nobody@AMIX");
+    drive(KEYS("\r" "/msg @nobody hi\r"), 0);
+    assert(M.modal == LC_MODAL_NONE && has_line(0, "User nobody not found"));
+    stop_stub();
+    start_stub();
+    strcpy(st->dm_unknown, "ghost@AMIX, zed@AMIX");
+    drive(KEYS("\r" "/msg @bob @ghost @zed hey\r"), 0);
+    assert(M.modal == LC_MODAL_NONE && has_line(0, "User ghost@AMIX, zed@AMIX not found"));
+    stop_stub();
     printf("  [OK] door: /msg @a and /msg @a @b send DM and group DM, DM lines render as the TS door's\n");
 }
 
@@ -1431,7 +1441,7 @@ static void test_door_message_formatting(void)
     start_stub();
     rc = drive(KEYS("\r" "say *slant* {red-fg}hot{/} @Tester\r"), 0);
     assert(rc == 0 && has_line("Tester", "*slant*"));              /* the event row carries the raw text */
-    assert(strstr(screen_text, "\033[0;3;49;38;5;195mslant") != 0);            /* *x*: italic in the text colour */
+    assert(strstr(screen_text, "\033[0;3;49;38;5;255mslant") != 0);            /* *x*: italic in the text colour */
     assert(strstr(screen_text, "\033[0;49;31mhot") != 0);                          /* {red-fg}: ANSI red, the tag eaten */
     assert(strstr(screen_text, "\033[0;7;49;33m@Tester") != 0);   /* own name: reversed yellow */
     stop_stub();
@@ -1449,15 +1459,15 @@ static const char *last_of(const char *hay, const char *needle)
 
 static void test_view_theme(void)
 {
-    const char *last146, *last195;
+    const char *last146, *last255;
     int rc;
     start_stub();
     rc = drive(KEYS("\t\t" "\x1b[C\x1b[C" "\x1b[B" "\r" "\x1b[B" "q" "/q\r"), 0);   /* menu bar, View, Theme; down previews; q reverts */
     assert(rc == 0);
     last146 = last_of(screen_text, "38;5;146m");
-    last195 = last_of(screen_text, "38;5;195m");
+    last255 = last_of(screen_text, "38;5;255m");
     assert(last146 != 0);                                             /* the preview drew neon-muted ink */
-    assert(last195 != 0 && last195 > last146);                        /* after q the door is neon again */
+    assert(last255 != 0 && last255 > last146);                        /* after q the door is neon again */
     stop_stub();
     assert(theme_written[0] == '\0');                                 /* a revert saves nothing */
     start_stub();
@@ -1554,9 +1564,31 @@ static void test_door_emoji_picker(void)
     printf("  [OK] door: F4 opens the emoji picker and Tab, Enter appends :smile: to the input\n");
 }
 
+/* The hub allows 500-byte messages: clean() keeps one whole, and a cut never splits a UTF-8 sequence or a tag. */
+static void test_clean_long_text(void)
+{
+    static char src[700], dst[LC_TEXT_MAX];
+    int i;
+    memset(src, 'a', 500); src[500] = '\0';
+    clean(dst, sizeof dst, src);
+    assert(strlen(dst) == 500);
+    for (i = 0; i < 699; i++) src[i] = 'a';
+    src[699] = '\0';
+    src[LC_TEXT_MAX - 3] = (char)0xE2; src[LC_TEXT_MAX - 2] = (char)0x82; src[LC_TEXT_MAX - 1] = (char)0xAC;   /* a 3-byte glyph ends one byte past the cut */
+    clean(dst, sizeof dst, src);
+    assert(strlen(dst) == LC_TEXT_MAX - 3);                        /* the glyph is dropped whole */
+    memset(src, 'a', 699); src[LC_TEXT_MAX - 1 - 6] = '{'; memcpy(src + LC_TEXT_MAX - 1 - 5, "red-f", 5);
+    clean(dst, sizeof dst, src);
+    assert(strlen(dst) == (size_t)(LC_TEXT_MAX - 1 - 6));          /* the open {tag is dropped */
+    memset(src, 'a', 699); src[LC_TEXT_MAX - 1 - 4] = '~'; memcpy(src + LC_TEXT_MAX - 1 - 3, "fir", 3);
+    clean(dst, sizeof dst, src);
+    assert(strlen(dst) == (size_t)(LC_TEXT_MAX - 1 - 4));          /* the open ~effect is dropped */
+}
+
 int main(void)
 {
     ae_native_set_exchange(board, 0);
+    test_clean_long_text();
     test_config();
     test_client();
     test_door_keys();

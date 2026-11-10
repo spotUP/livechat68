@@ -50,7 +50,9 @@ void lc_theme_set(const unsigned long *rgb);
 int lc_tone(int tone);
 
 #define LC_LINES     80
-#define LC_TEXT_MAX  240
+/* 640 holds the hub's 500-byte message (amiexpress-doorserver contract/chat-types.ts contentMax) plus the "[Group DM from x]: "
+ * prefix a DM note adds, and the NUL. 80 lines x 640 = 51200 bytes of log text. */
+#define LC_TEXT_MAX  640
 
 /* LC_NOTE: a line of the door's own in the accent colour, no time (TS addChatMessage(text, false)
    with an accent tag, e.g. "[bob reacted heart]"). */
