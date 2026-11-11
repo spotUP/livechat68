@@ -485,16 +485,12 @@ static void test_door_room_kind(void)
     int rc;
     start_stub();
     st->rooms_kinds = 1;
-    /* /create asks Text, Voice or Art; Down Down Enter picks Art, which the door cannot open yet. */
+    /* /create asks Text, Voice or Art; Down Down Enter picks Art, which opens the draw canvas. */
     rc = drive(KEYS("\r" "/create Sketch\r" "\x1b[B" "\x1b[B" "\r" "/q\r"), 0);
     assert(rc == 0 && st->rooms_created == 1 && strcmp(st->last_created, "Sketch") == 0);
     assert(strcmp(st->last_created_kind, "art") == 0);
-    assert(has_line(0, "Creating #Sketch..."));                    /* TS pickRoomKind: Art is refused, so the log stays */
-    assert(has_line(0, "Channel type: Text, Voice or Art?"));
-    assert(has_line(0, "Art channels are not on Amiga yet."));
-    assert(st->joins == 1);                                        /* only the auto-join: Art is not opened */
-    assert(strstr(screen_text, "[A] Paint") != 0);                 /* the Art room is marked */
-    assert(strstr(screen_text, "Talk") == 0);                      /* the Voice room is not listed for telnet */
+    assert(st->joins == 2 && strcmp(st->last_join, "newroom") == 0);   /* the auto-join, then the new room (the stub's list has no "newroom", so it opens as text) */
+    assert(!has_line(0, "Art channels are not on Amiga yet."));
     stop_stub();
     start_stub();
     st->rooms_kinds = 1;
@@ -844,17 +840,60 @@ static void test_door_emoji_commands(void)
     printf("  [OK] door: /emoji <query> and /emojis [category] print the TS lists\n");
 }
 
-/* Web-only TS views (voice, mic, draw, files) answer with "not on Amiga yet", never "Unknown command". */
+/* Reachability (plan C8): /draw <art room> through the door's real entry opens the hub canvas, paints with the
+ * ui_paint tools, posts the ops, and repaints on a canvas event from another caller. */
+static void test_door_draw(void)
+{
+    ui_cell c;
+    long rev0;
+    start_stub();
+    st->rooms_kinds = 1;
+    strcpy(st->canvas_rows, "5|          Z\n");                      /* sentinel: 'Z' at (10,5) */
+    st->canvas_row_count = 1;
+    st->canvas_rev = 7;
+    strcpy(st->canvas_inject, "@70,20:^2e$");                         /* Alice draws '$' once we are in the room: rev 8 */
+    poll_steps = 2; poll_step_ticks = IDLE_SLEEP_TICKS;
+    /* Right x3, Down x2, Space paints '#' at (3,2) and posts at once; Ctrl+Q then y quits. */
+    drive(KEYS("\r" "/draw paint\r" "\x1b[C\x1b[C\x1b[C\x1b[B\x1b[B" " " "\x11" "y"), 1);
+    poll_steps = POLL_STEPS_DEFAULT; poll_step_ticks = POLL_STEP_TICKS;
+    rev0 = 7;
+    assert(strcmp(st->last_join, "paint") == 0 && st->canvas_get_calls >= 1);          /* the door fetched the snapshot */
+    assert(ui_canvas_get(&dr_cv, 10, 5, &c) && c.ch == 'Z');                          /* sentinel from the snapshot */
+    assert(ui_canvas_get(&dr_cv, 70, 20, &c) && c.ch == '$' && c.fg == 2 && c.bg == 14);   /* repainted by the canvas event */
+    assert(ui_canvas_get(&dr_cv, 3, 2, &c) && c.ch == '#' && c.fg == 15);             /* the caller's own stroke */
+    assert(st->canvas_post_calls == 1 && strstr(st->canvas_post_log, "@3,2:") != 0 && strchr(st->canvas_post_log, '#') != 0);
+    assert(dr_rev == rev0 + 2 && st->canvas_rev == rev0 + 2);                         /* event rev 8, own post rev 9 */
+    stop_stub();
+    printf("  [OK] door: /draw opens the art room canvas, paints and posts ops, repaints on a canvas event\n");
+}
+
+/* The pen picker (plan D7): h opens a popup; the Char page picks '3', the Fore page colour 13; Space paints both. */
+static void test_door_draw_picker(void)
+{
+    ui_cell c;
+    start_stub();
+    st->rooms_kinds = 1;
+    /* h, Down (char '#' -> '3'), Enter applies, Tab to Fore, Left x2 (15 -> 13), Enter, h closes; Space paints; Ctrl+Q y quits. */
+    poll_steps = 2; poll_step_ticks = IDLE_SLEEP_TICKS;
+    drive(KEYS("\r" "/draw paint\r" "h" "\x1b[B" "\r" "\t" "\x1b[D\x1b[D" "\r" "h" " " "\x11" "y"), 1);
+    poll_steps = POLL_STEPS_DEFAULT; poll_step_ticks = POLL_STEP_TICKS;
+    assert(ui_canvas_get(&dr_cv, 0, 0, &c) && c.ch == '3' && c.fg == 13);
+    assert(lc_pick_char(0) == ' ' && lc_pick_char(94) == '~' && lc_pick_char(95) == 0xA0 && lc_pick_char(190) == 0xFF);
+    stop_stub();
+    printf("  [OK] door: /draw h opens the colour and character picker and the pen paints what it picked\n");
+}
+
+/* Web-only TS views (voice, mic, files) answer with "not on Amiga yet", never "Unknown command". */
 static void test_door_web_only_commands(void)
 {
     start_stub();
-    drive(KEYS("\r" "/voice\r" "/vc join x\r" "/mic\r" "/deafen\r" "/undeaf\r" "/draw\r" "/art\r" "/files\r" "/share\r"), 0);
+    drive(KEYS("\r" "/voice\r" "/vc join x\r" "/mic\r" "/deafen\r" "/undeaf\r" "/files\r" "/share\r"), 0);
     assert(has_line(0, "Voice is not on Amiga yet."));
-    assert(has_line(0, "Drawing is not on Amiga yet."));
+    assert(!has_line(0, "Drawing is not on Amiga yet."));
     assert(has_line(0, "File sharing is not on Amiga yet."));
     assert(!has_line(0, "Unknown command. Type /help for help."));
     stop_stub();
-    printf("  [OK] door: voice, mic, draw and files say they are not on Amiga yet\n");
+    printf("  [OK] door: voice, mic and files say they are not on Amiga yet\n");
 }
 
 /* B2: delete by default takes the caller's last line; a kick of the caller leaves the room; low levels are refused. */
@@ -1004,7 +1043,7 @@ static void test_door_typing(void)
     start_stub();                                                      /* another user's buffer becomes a preview row */
     strcpy(st->pending_row, "typing|lobby|Alice||1700000500|0|hel");
     poll_steps = 2; poll_step_ticks = IDLE_SLEEP_TICKS;
-    drive(KEYS("\r" "/q\r"), 1);
+    drive(KEYS("\r" "/qui\r"), 1);                                    /* half-typed: Enter fills "/quit " ("/q" is an alias and runs) */
     assert(typing_row("Alice", "hel") && typing_row("Tester", "/quit "));   /* own row: local echo of the input */
     assert(strstr(screen_text, "Alice") != 0 && strstr(screen_text, "> hel") != 0);   /* painted under the log */
     stop_stub();
@@ -1102,6 +1141,122 @@ static void test_door_dm_and_group_dm(void)
     assert(M.modal == LC_MODAL_NONE && has_line(0, "User ghost@AMIX, zed@AMIX not found"));
     stop_stub();
     printf("  [OK] door: /msg @a and /msg @a @b send DM and group DM, DM lines render as the TS door's\n");
+}
+
+static void test_door_file_shared_picture(void)
+{
+    start_stub();
+    strcpy(st->pending_row, "file_shared|lobby|alice|f77|1700000500|0|sunset.png!182000!image");
+    poll_steps = 2; poll_step_ticks = IDLE_SLEEP_TICKS;
+    drive(KEYS("\r" "/q\r"), 1);
+    poll_steps = POLL_STEPS_DEFAULT; poll_step_ticks = POLL_STEP_TICKS;
+    assert(has_line(0, "alice shared a picture: sunset.png (/view)  #1 [PICTURE] sunset.png"));
+    stop_stub();
+    printf("  [OK] door: a file_shared picture event prints the picture line\n");
+}
+
+/* LC1-LC3: inline pictures. The hub's files list is merged into the join history in time order, the picture is
+ * stored in the terminal (a=t) and placed (a=p, C=1) with a vertical crop that follows the scrolling, and
+ * /view N with kitty is a full-size overlay whose Esc deletes the image. */
+static int line_index(const char *text)
+{
+    int i;
+    for (i = 0; i < M.nlines; i++) if (strstr(M.lines[i].text, text) != 0) return i;
+    return -1;
+}
+
+static void capture_present(char *dst, size_t cap)
+{
+    int saved = dup(1), out;
+    FILE *f;
+    size_t got;
+    fflush(stdout);
+    out = open("build/test_chat_present.bin", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    assert(out >= 0);
+    dup2(out, 1); close(out);
+    present();
+    fflush(stdout);
+    dup2(saved, 1); close(saved);
+    clearerr(stdout);
+    f = fopen("build/test_chat_present.bin", "rb"); assert(f);
+    got = fread(dst, 1, cap - 1, f); dst[got] = '\0'; fclose(f);
+}
+
+static int crop_y(const char *text)
+{
+    const char *p = strstr(text, "a=p");
+    const char *y = p != 0 ? strstr(p, ",y=") : 0;
+    return y != 0 ? atoi(y + 3) : -1;
+}
+
+static void test_door_pictures_kitty(void)
+{
+    static char frame[65536];
+    int i, a, pic, b, saw_crop = 0, saw_delete = 0, last_y = -2, changes = 0;
+    setenv("AE_HOST", "amiexpress-web", 1);
+    setenv("AE_CAPS", "ansi,kitty", 1);
+    ae_host_reset();
+    start_stub();
+    st->files_pic = 1;
+    drive(KEYS("\r" "/q\r"), 1);
+    assert(st->previews >= 1);                                                      /* the thumbnail was fetched */
+    a = line_index("hello there!bar"); pic = line_index("[PICTURE] sunset.png"); b = line_index("second line");
+    assert(a >= 0 && pic > a && b > pic);                                           /* LC1: between alice (000) and bob (060) */
+    assert(strstr(screen_text, "\033_Ga=t,") != 0 && strstr(screen_text, "a=p") != 0 && strstr(screen_text, "C=1") != 0);
+    assert(strstr(screen_text, "\033_Ga=T") == 0);                                  /* stored, never drawn at the cursor */
+    /* scroll the log: the crop changes row by row, and the image is deleted once fully out. /q closed
+     * the door's cell grid, so the scroll phase reopens one at the door's last screen size. */
+    assert(ui_cells_open(&cells, screen.cols, screen.rows) == 0);
+    for (i = 0; i < 40; i++) {
+        lc_line *l = line_slot(M.nlines);
+        l->kind = LC_SYSTEM; strcpy(l->text, "filler");
+    }
+    for (i = 0; i < 160; i++) {                                                     /* up into history, then back down */
+        int y;
+        M.scroll = i < 80 ? i : 159 - i;
+        capture_present(frame, sizeof frame);
+        y = crop_y(frame);
+        if (strstr(frame, "a=p") != 0 && strstr(frame, "C=1") == 0) assert(!"placement without C=1");
+        /* a move re-places with the same placement id, so the terminal swaps it in one step: no delete first */
+        if (strstr(frame, "a=p") != 0 && strstr(frame, ",p=1,") == 0) assert(!"placement without p=1");
+        if (strstr(frame, "a=p") != 0 && strstr(frame, "d=i") != 0) assert(!"delete before a move");
+        if (y >= 0) saw_crop = 1;
+        if (y != last_y) changes++;
+        last_y = y;
+        if (strstr(frame, "a=d") != 0) saw_delete = 1;
+    }
+    assert(saw_crop && changes >= 3 && saw_delete);
+    ui_cells_close(&cells);
+    stop_stub();
+    /* no kitty: the old behaviour, no graphics bytes and no picture rows */
+    setenv("AE_CAPS", "ansi", 1);
+    ae_host_reset();
+    start_stub();
+    st->files_pic = 1;
+    drive(KEYS("\r" "/q\r"), 1);
+    assert(st->previews == 0 && strstr(screen_text, "\033_G") == 0);
+    stop_stub();
+    unsetenv("AE_HOST"); unsetenv("AE_CAPS");
+    ae_host_reset();
+    printf("  [OK] door: kitty pictures merge into history, place with C=1, p=1 and a scrolling crop; no kitty keeps text only\n");
+}
+
+static void test_door_view_kitty_esc(void)
+{
+    setenv("AE_HOST", "amiexpress-web", 1);
+    setenv("AE_CAPS", "ansi,kitty", 1);
+    ae_host_reset();
+    start_stub();
+    strcpy(st->pending_row, "file_shared|lobby|alice|f77|1700000500|0|sunset.png!182000!image");
+    poll_steps = 2; poll_step_ticks = IDLE_SLEEP_TICKS;
+    drive(KEYS("\r" "/view 1\r" "\033" "/q\r"), 1);
+    poll_steps = POLL_STEPS_DEFAULT; poll_step_ticks = POLL_STEP_TICKS;
+    assert(strstr(screen_text, "a=p,i=30") != 0);                                   /* the overlay image was placed */
+    assert(strstr(screen_text, "a=d,d=I,i=30,q=2") != 0);                           /* Esc deleted it */
+    stop_stub();
+    unsetenv("AE_HOST"); unsetenv("AE_CAPS");
+    ae_host_reset();
+    printf("  [OK] door: /view N with kitty overlays the full picture and Esc deletes it\n");
 }
 
 static void test_door_board_joined(void)
@@ -1621,6 +1776,9 @@ int main(void)
     test_door_react_without_event();
     test_door_delete_and_kicked();
     test_door_b4_presence();
+    test_door_file_shared_picture();
+    test_door_pictures_kitty();
+    test_door_view_kitty_esc();
     test_door_board_joined();
     test_door_dm_and_group_dm();
     test_door_typing();
@@ -1639,6 +1797,8 @@ int main(void)
     test_view_closes_on_esc_or_q();
     test_door_emoji_commands();
     test_door_web_only_commands();
+    test_door_draw();
+    test_door_draw_picker();
     test_door_no_config();
     test_config_save();
     test_register();

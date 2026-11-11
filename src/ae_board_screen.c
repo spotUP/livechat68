@@ -72,6 +72,24 @@ int ae_bs_size(int *cols, int *rows)
     return ae_bs_parse_size(reply, cols, rows);
 }
 
+int ae_bs_wide(int on)
+{
+    char reply[AE_MAX_LINE + 1];
+    int n = ask(on ? "WIDE ON" : "WIDE OFF", reply, (int)sizeof(reply));
+
+    if (n < 0) return AE_BS_GONE;
+    return strcmp(reply, "OK") == 0 ? 1 : 0;
+}
+
+int ae_bs_wide_state(void)
+{
+    char reply[AE_MAX_LINE + 1];
+    int n = ask("WIDE?", reply, (int)sizeof(reply));
+
+    if (n < 0) return AE_BS_GONE;
+    return strcmp(reply, "ON") == 0 ? 1 : 0;
+}
+
 int ae_bs_wipe_begin(char letter, int conceal)
 {
     char req[24], reply[AE_MAX_LINE + 1];

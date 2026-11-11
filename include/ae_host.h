@@ -74,6 +74,8 @@ typedef unsigned long ae_caps_t;
 #define AE_CAP_WIDE      (1UL << 3)
 /** Mouse reports reach the door. */
 #define AE_CAP_MOUSE     (1UL << 4)
+/** The caller's terminal draws kitty graphics pictures (ae_kitty.h encodes them). */
+#define AE_CAP_KITTY     (1UL << 5)
 
 /** Everything the board said, read once. */
 typedef struct {

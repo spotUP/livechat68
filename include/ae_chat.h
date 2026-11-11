@@ -37,6 +37,13 @@ extern "C" {
 #define AE_CHAT_ERR_STATUS    -4  /* the server answered with an error; see c->status and c->error */
 #define AE_CHAT_ERR_BODY      -5  /* a 2xx whose body is not the expected shape */
 
+#define AE_CHAT_ERR_NOT_MEMBER      -6  /* 403 not_member: the caller is not in the file's room */
+#define AE_CHAT_ERR_NOT_IMAGE       -7  /* 415 not_image: the file has no picture preview */
+#define AE_CHAT_ERR_FILES_DISABLED  -8  /* 503 files_disabled: the hub has file sharing off */
+#define AE_CHAT_ERR_PREVIEW_TOO_BIG -9  /* the preview body is larger than the caller's buffer (or AE_CHAT_PREVIEW_MAX) */
+
+#define AE_CHAT_PREVIEW_MAX 131072UL    /* the hub fits q=pal previews within this many bytes */
+
 #define AE_CHAT_BASE "/chat/v1"
 #define AE_CHAT_REPLY_MAX 8192
 #define AE_CHAT_DEFAULT_TIMEOUT 10
@@ -145,8 +152,21 @@ int ae_chat_react(ae_chat *c, const char *msg_id, const char *emoji, int *count)
 /** DELETE /messages/:id/react/:emoji: takes the caller's reaction back. `count` (may be NULL) gets the new count. */
 int ae_chat_unreact(ae_chat *c, const char *msg_id, const char *emoji, int *count);
 
+/** GET /files/:id/preview.png?q=pal (rgb == 0: 255-colour indexed PNG, exactly cols*8 x rows*16 pixels) or
+ *  preview.rgb (rgb != 0), with cols=&rows= when both > 0 (the hub clamps cols to 4..80 and fits rows). The body goes into `buf` (at most min(cap, AE_CHAT_PREVIEW_MAX) bytes). Returns the byte
+ *  count (> 0), and `out_cols`/`out_rows` (either may be NULL) get the X-Cells header (0 when absent), or
+ *  AE_CHAT_ERR_NOT_MEMBER / _NOT_IMAGE / _FILES_DISABLED / _PREVIEW_TOO_BIG, AE_CHAT_ERR_TRANSPORT for a
+ *  network failure, AE_CHAT_ERR_STATUS (c->error) for any other refusal. */
+int ae_chat_file_preview(ae_chat *c, const char *file_id, int cols, int rows, int rgb,
+                         unsigned char *buf, unsigned long cap, int *out_cols, int *out_rows);
+
 /** GET /messages/:id/reactions.txt. Rows: emoji, count, mine (1 when the caller reacted with it). */
 int ae_chat_reactions(ae_chat *c, const char *msg_id);
+
+/** GET /rooms/:id/files.txt: the files shared in a room, newest first (at most 200). Rows (ae_chat_next_row):
+ *  id, name, size, uploader, created_at (epoch seconds), label, kind, imgW, imgH. Members only; a hub with no
+ *  files directory answers 503 files_disabled (AE_CHAT_ERR_STATUS). */
+int ae_chat_files(ae_chat *c, const char *room);
 
 /** PUT /messages/:id {content}: replaces the text of the caller's own message. */
 int ae_chat_edit(ae_chat *c, const char *msg_id, const char *text);
@@ -164,6 +184,16 @@ int ae_chat_room_motd(ae_chat *c, const char *room, const char *motd);
  * members see it as it is typed. An empty text means the caller stopped (sent or cleared the line).
  * The hub emits it as a "typing" event; callers throttle. */
 int ae_chat_typing(ae_chat *c, const char *room, const char *text);
+
+/** GET /rooms/:id/canvas.txt?from&count (an art room's shared 80x24 canvas). The reply is left whole in
+ *  c->reply / c->reply_len ("CANVAS|1|rev|rows" then "y|cells" rows, spaces kept): hand it to
+ *  ui_canvas_parse_reply. Ask again from the next row when the header's row count is below count. */
+int ae_chat_canvas_get(ae_chat *c, const char *room, int from, int count);
+
+/** POST /rooms/:id/canvas {base, ops}: ops is a canvas wire string (len bytes, at most 512). *rev (may be
+ *  NULL) gets the new revision. A refusal is AE_CHAT_ERR_STATUS with c->error (forbidden, too_long,
+ *  bad_request, rate_limited). */
+int ae_chat_canvas_post(ae_chat *c, const char *room, long base, const char *ops, int len, long *rev);
 
 /** POST /rooms/:id/mode {modes, params} (TS /mode): staff apply a mode string such as "+mv" with
  * space-separated params. `applied` gets what took effect ("+m +v bob@BOARD"), `errors` the

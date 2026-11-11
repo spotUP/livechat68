@@ -36,6 +36,10 @@ typedef struct {
     int responsive;
     /** Whether the caller's cursor is shown. THE SCREEN OWNS THE CURSOR STATE; board-drawn writes re-assert it. */
     int cursor_visible;
+    /** The wide switch (ui_screen_wide_*): the choice this door last asked for, and the polls left to watch a size change settle. */
+    int wide;
+    int wide_watch;
+    int wide_tick;
 } ui_screen;
 
 /**
@@ -59,6 +63,24 @@ int ui_screen_open_responsive(ui_screen *sc, ae_session *s, char *frame, long ca
 
 /** Ask the board for the size again - after a resize, or on a hunch. */
 void ui_screen_measure(ui_screen *sc);
+
+/*
+ * The 80x25 / responsive switch for a responsive door (the port of sdk/utils/terminal-mode.ts). Three calls:
+ *
+ *   ui_screen_open_responsive(...);
+ *   ui_screen_wide_restore(&sc);              once at start: the call's saved choice is asked of the terminal
+ *   ...
+ *   key = ui_key_read(&keys, &pushback);      in the input loop
+ *   if (ui_screen_wide_step(&sc, &key, &pushback)) relayout();    key is 0 when Alt+Enter was eaten
+ *   (and in the idle hook)  if (ui_screen_wide_step(&sc, 0, 0)) relayout();
+ *
+ * relayout() is the door's own: reopen what took the size at construction, keep the content, repaint.
+ * ui_screen_wide_step returns 1 when sc->cols / sc->rows changed since the last call. Alt+Enter reaches the
+ * door as ESC CR (UI_KEY_ESC with '\r' pushed back); the step toggles and swallows it, so a door gets no stray
+ * Enter. A silent board changes nothing.
+ */
+void ui_screen_wide_restore(ui_screen *sc);
+int ui_screen_wide_step(ui_screen *sc, int *key, int *pushback);
 
 /**
  * Show or hide the caller's cursor, and REMEMBER which (ui_screen_open hides it).

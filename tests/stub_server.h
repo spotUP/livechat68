@@ -122,8 +122,17 @@ typedef struct {
     char last_created_kind[16];            /* "kind" of the latest POST /rooms, "" when it sent none */
     char last_created_topic[100];          /* its "topic" */
     char last_created_vis[16];             /* its "visibility" */
+    volatile int canvas_get_calls, canvas_post_calls;   /* GET canvas.txt, POST /rooms/:id/canvas */
+    volatile int canvas_rev;               /* revision the stub serves and bumps per accepted post */
+    char canvas_rows[1200];                /* test sets: the "y|cells" rows a canvas.txt reply carries (one per line) */
+    int canvas_row_count;                  /* test sets: the header's row count */
+    char canvas_inject[80];                /* set: the next snapshot also queues a canvas event from Alice with these ops (rev + 1) */
+    char canvas_post_log[1200];            /* every canvas post's ops, each followed by '|' */
+    char last_canvas_body[700];            /* the raw JSON body of the latest canvas post */
     int rooms_kinds;                       /* set: rooms.txt also lists an art and a voice room, kind last */
     char last_join[64];                    /* room id from the latest POST /rooms/<id>/join path */
+    int files_pic;                         /* test sets: files.txt lists one picture (f77, sunset.png, at 1700000030) */
+    volatile int previews;                 /* GET preview.png calls served (a 64x48 PNG, X-Cells 12x4) */
 } stub_chat_stats;
 
 /* Starts the chat stub. Returns its port, or -1; *stats points at shared counters. */

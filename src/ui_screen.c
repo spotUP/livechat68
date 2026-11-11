@@ -8,6 +8,7 @@
 
 #include "ui_screen.h"
 #include "ui_ansi.h"
+#include "ui_key.h"
 #include "aedoor.h"
 #include "ae_board_screen.h"
 #include "ae_host.h"
@@ -125,6 +126,42 @@ void ui_screen_measure(ui_screen *sc)
     /* And the writer is told what this screen can paint, so every bar,
        status line and selected row gets it without asking. */
     apply_profile(sc, sc->cols);
+}
+
+/* A size change reaches a web caller a moment after the toggle (the terminal resizes, then reports): watch this many
+   steps closely after a toggle, then once in WIDE_SLOW_EVERY steps (a manual browser resize). */
+#define WIDE_WATCH_STEPS 40
+#define WIDE_SLOW_EVERY  8
+
+void ui_screen_wide_restore(ui_screen *sc)
+{
+    if (!sc) return;
+    sc->wide = ae_bs_wide_state() == 1;
+    /* As the TS switch: the saved choice is asked of the terminal at start (a door starts fixed otherwise). */
+    if (sc->wide) ae_bs_wide(1);
+    sc->wide_watch = sc->wide ? WIDE_WATCH_STEPS : 0;
+}
+
+int ui_screen_wide_step(ui_screen *sc, int *key, int *pushback)
+{
+    int cols, rows;
+
+    if (!sc || !sc->responsive) return 0;
+    if (key && pushback && *key == UI_KEY_ESC && *pushback == '\r') {
+        *pushback = -1;
+        *key = 0;
+        sc->wide = !sc->wide;
+        ae_bs_wide(sc->wide);
+        sc->wide_watch = WIDE_WATCH_STEPS;
+    } else if (sc->wide_watch > 0) {
+        sc->wide_watch--;
+    } else if (++sc->wide_tick % WIDE_SLOW_EVERY != 0) {
+        return 0;
+    }
+    cols = sc->cols;
+    rows = sc->rows;
+    ui_screen_measure(sc);
+    return sc->cols != cols || sc->rows != rows;
 }
 
 void ui_screen_cursor(ui_screen *sc, int visible)

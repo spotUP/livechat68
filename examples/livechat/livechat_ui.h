@@ -17,6 +17,7 @@
 
 #include "ui_cells.h"
 #include "ui_theme.h"
+#include "ui_canvas.h"
 
 /* The door's colours are the active ui_theme's tokens, as xterm-256 cube indexes (TS ui/theme.ts T.*). One
    table, lc_col[], filled by lc_theme_set(); a View > Theme preview re-fills it and the next frame repaints. */
@@ -59,7 +60,9 @@ int lc_tone(int tone);
 /* LC_EVENT: a board event (hub "bbs" row), TS handlers/bbs-event.handler.ts formatEvent and the
    legacy "[EVENT] ..." feed line (server.ts updateEventsFeed): "[hh:mm] " in the accent when the line
    has a time, `head` in `tone`, `text` in `body_tone` (0: the pen), then " [NEW PB!]" when `pb`. */
-enum { LC_SYSTEM, LC_ACTIVITY_LINE, LC_HISTORY, LC_LIVE, LC_NOTE, LC_EVENT };
+/* LC_PICTURE: one cell row of an inline picture (kitty graphics draw over the blank row). A picture of N
+   rows is N lines (pic = its serial, pic_row = 0..N-1), so the log scrolls it row by row like text. */
+enum { LC_SYSTEM, LC_ACTIVITY_LINE, LC_HISTORY, LC_LIVE, LC_NOTE, LC_EVENT, LC_PICTURE };
 
 /* The TS event tags on this theme (sdk/engines/ui/theme/tokens.ts), as cell colours. A cell colour
    is 1..255, so blessed "black" (T.bar) is xterm 16. */
@@ -105,7 +108,14 @@ typedef struct {
     char head[48];         /* LC_EVENT: "* bob", "[Tetris]", "[EVENT] " */
     int tone, body_tone;   /* LC_EVENT colours */
     int pb;                /* LC_EVENT: a personal best tag */
+    long epoch;            /* HISTORY / LIVE: the message time in epoch seconds, 0 when unknown */
+    int pic, pic_row;      /* LC_PICTURE: the picture's serial and which of its rows this line is */
 } lc_line;
+
+/* The chat log's last drawn geometry (0 rows before the first draw, or when the pane is too small) and
+   which line sits on log row r (-1 none): how the door finds where a picture's rows are on screen. */
+extern int lc_chat_body, lc_chat_left, lc_chat_rows, lc_chat_width;
+int lc_chat_row_line(int r);
 
 enum { LC_SIDE_HEAD, LC_SIDE_ROOM, LC_SIDE_USER, LC_SIDE_DM, LC_SIDE_BLANK };
 
@@ -127,6 +137,17 @@ enum { LC_FOCUS_INPUT, LC_FOCUS_SIDEBAR, LC_FOCUS_MENU };
 enum { LC_MODAL_NONE, LC_MODAL_MESSAGE, LC_MODAL_QUIT, LC_MODAL_PROMPT, LC_MODAL_RECONNECT };
 
 #define LC_INPUT_MAX 256
+/* The /draw pen picker (plan D7 a): one popup, three pages, Fore and Back colours (2 x 8 grid) and the
+ * latin1 characters (16 wide: 0x20-0x7E then 0xA0-0xFF). */
+#define LC_PICK_FORE 0
+#define LC_PICK_BACK 1
+#define LC_PICK_CHAR 2
+#define LC_PICK_W    18                  /* border + 16 cells + border: fits a 40-column caller */
+#define LC_PICK_CHARS 191
+typedef struct {
+    int open, page, cur[3];              /* cur: the highlighted cell of each page */
+    int top, left;
+} lc_pick;
 /* TS typingBuffers: one live preview row per typer (D3). The hub caps the text at 200 bytes. */
 #define LC_TYPING_MAX 4
 typedef struct { char nick[24]; char text[204]; } lc_typing;
@@ -154,6 +175,17 @@ typedef struct {
     int focus;
     int menu;                      /* open dropdown 0..3, -1 none */
     int menu_sel;
+    int draw;                      /* the /draw canvas view replaces the chat screen */
+    const ui_canvas *canvas;       /* the grid the view paints (the door owns it) */
+    int dr_x, dr_y;                /* canvas cursor */
+    int dr_left, dr_top;           /* first canvas column / row in view: a 40-column caller sees a scrolled window */
+    int dr_fg, dr_bg, dr_ch;       /* the pen */
+    int dr_anchor;                 /* a shape tool waits for its second corner */
+    int dr_down;                   /* pen down: cursor moves paint */
+    char dr_tool[20];              /* the tool's name for the status line */
+    char dr_note[48];              /* last refusal or hint, "" when none */
+    ui_popup dr_pop;               /* the tool menu */
+    lc_pick dr_pick;               /* the colour and character picker (h) */
     int help;                      /* help overlay shown */
     int help_top;
     int view;                      /* text overlay shown (the thread view) */
@@ -243,7 +275,8 @@ enum { LC_HIT_NONE, LC_HIT_MENU, LC_HIT_DROPDOWN, LC_HIT_SIDEBAR, LC_HIT_CHAT, L
        LC_HIT_STATUS, LC_HIT_POPUP, LC_HIT_YES, LC_HIT_NO, LC_HIT_OK, LC_HIT_MODAL, LC_HIT_SCROLLBAR,
        LC_HIT_FMT, LC_HIT_FMT_CAT, LC_HIT_FMT_ITEM, LC_HIT_FMT_CLOSE,
        LC_HIT_SEARCH, LC_HIT_SEARCH_Q, LC_HIT_SEARCH_USER, LC_HIT_SEARCH_ROW,
-       LC_HIT_SETTINGS, LC_HIT_SETTINGS_ROW, LC_HIT_THEME, LC_HIT_THEME_ROW };   /* SETTINGS_ROW index: the LC_SET_* row, -1 a gap */
+       LC_HIT_SETTINGS, LC_HIT_SETTINGS_ROW, LC_HIT_THEME, LC_HIT_THEME_ROW,
+       LC_HIT_CANVAS };   /* the /draw grid; the index is unused, the door maps row/col itself */   /* SETTINGS_ROW index: the LC_SET_* row, -1 a gap */
 
 /* ---- the settings overlay rows (TS settings-checkboxes-events/-prefs, settings-status-radio) ---- */
 enum { LC_SET_LOGINS, LC_SET_FILES, LC_SET_DOORS, LC_SET_MESSAGES, LC_SET_ANNOUNCE,
@@ -278,12 +311,19 @@ int lc_slash_match(const char *input, int *idx, int max);
 void lc_slash_row(char *out, int cap, int cmd, int cols, int *ucol, int *ulen);
 /** 1 when `input` is exactly "/name" for command `cmd` (Enter then runs it instead of filling). */
 int lc_slash_exact(const char *input, int cmd);
+/** 1 when `input` is exactly "/word" for the name or an alias of ANY command. The palette also lists
+ *  description matches ("/share" lists /view, "Preview a shared picture"), so Enter checks every
+ *  command, not only the one it would fill in (TS paletteEnterAction). */
+int lc_slash_complete(const char *input);
 /** Top match when its name starts with the typed term (TS ghost completion), else -1. */
 int lc_slash_ghost(const char *input, const int *idx, int n);
 /** The new first-visible match that keeps `sel` inside LC_SLASH_ROWS of `n` matches. */
 int lc_slash_scroll(int sel, int top, int n);
 
 void lc_model_init(lc_model *m, int cols, int rows);
+/** The terminal changed size: the model takes the new size and keeps everything else (transcript, input, rooms).
+ *  The wrapped-row cache and the scroll position are rebuilt against the new width. */
+void lc_model_resize(lc_model *m, int cols, int rows);
 /** Call after ANY change to m->lines or m->nlines (add, remove, edit, reaction): draw_chat caches each
  *  line's wrapped row count against m->lines_gen and would otherwise draw stale rows. */
 void lc_lines_changed(lc_model *m);
@@ -334,6 +374,16 @@ void lc_draw(ui_cells *c, const lc_model *m, int *cursor_row, int *cursor_col);
 /** The region under 0-based row/col in the last drawn frame (LC_HIT_*). *index: the menu (MENU), the
  *  item (DROPDOWN), the side item (SIDEBAR), the line index or -1 for an empty row (CHAT), the column (STATUS). */
 int lc_hit(int row, int col, int *index);
+
+/** The character at cell i of the Char page (0..LC_PICK_CHARS-1): 0x20-0x7E, then 0xA0-0xFF. */
+int lc_pick_char(int i);
+/** Open the picker on the Char page with the cursor on the pen character. */
+void lc_pick_open(lc_model *m);
+/** A key while open: arrows move, Tab / Shift-Tab change page, Enter or Space applies to the pen (stays
+ *  open), Esc or h closes. Returns 1 when applied. */
+int lc_pick_key(lc_model *m, int key);
+/** A click at 0-based row/col: a tab label changes page, a cell applies it, outside closes. Returns 1 when applied. */
+int lc_pick_click(lc_model *m, int row, int col);
 /** The chat scroll offset (lc_model.scroll) that puts the scrollbar thumb's middle on 0-based screen
  *  `row` in the last drawn frame, clamped to the track; -1 when the frame drew no scrollbar. */
 int lc_scroll_at(int row);

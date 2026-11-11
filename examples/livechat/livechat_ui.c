@@ -1,4 +1,5 @@
 /* livechat_ui.c - draws the LIVECHAT68 frame from an lc_model (see livechat_ui.h). */
+#include "ui_key.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -111,6 +112,14 @@ void lc_model_init(lc_model *m, int cols, int rows)
     m->node = 1;
     m->menu = -1;
     m->timestamps = 1;
+}
+
+void lc_model_resize(lc_model *m, int cols, int rows)
+{
+    m->cols = cols;
+    m->rows = rows;
+    m->scroll = 0;                                   /* display rows back from the newest: that count is width-bound */
+    lc_lines_changed(m);
 }
 
 int lc_sidebar_width(const lc_model *m)
@@ -591,6 +600,9 @@ void lc_line_marked(const lc_line *l, char *out, int cap, int stamps, int width)
         if (strncmp(l->text, "--- ", 4) == 0) sb_ch(&b, UI_CELLS_M_BASE);   /* the TS history marker ends its grey early */
         sb_str(&b, " ***");
         break;
+    case LC_PICTURE:
+        sb_ch(&b, ' ');
+        break;
     case LC_NOTE:
         sb_fg(&b, l->tone > 0 ? l->tone : LC_ACCENT); sb_str(&b, l->text);
         break;
@@ -763,10 +775,16 @@ static void typing_marked(const lc_model *m, int i, char *out, int cap)
 
 #define CHAT_ROWS_MAX 128
 static ui_hit lc_hits;                              /* the last frame's click regions, topmost last */
+int lc_chat_body, lc_chat_left, lc_chat_rows, lc_chat_width;
 static int chat_row_line[CHAT_ROWS_MAX];            /* chat body row -> line index, -1 empty */
 
 /* The scrollbar of the last drawn chat pane, for lc_scroll_at (R1a drag). bar_rows 0 = no scrollbar. */
 static int bar_body, bar_rows, bar_thumb, bar_span;
+
+int lc_chat_row_line(int r)
+{
+    return r >= 0 && r < CHAT_ROWS_MAX ? chat_row_line[r] : -1;
+}
 
 static void draw_chat(ui_cells *c, const lc_model *m, int top, int h, int left, int w)
 {
@@ -789,10 +807,12 @@ static void draw_chat(ui_cells *c, const lc_model *m, int top, int h, int left, 
         body = top + 1;
         rows++;
     }
+    lc_chat_rows = 0;
     if (rows < 1 || width < 1) {
         ui_cells_fill(c, body, left + 1, top + h - 1 - body, w - 2, ' ');
         return;
     }
+    lc_chat_body = body; lc_chat_left = left + 1; lc_chat_rows = rows < CHAT_ROWS_MAX ? rows : CHAT_ROWS_MAX; lc_chat_width = width;
     ui_hit_add(&lc_hits, LC_HIT_CHAT, body, left + 1, rows, w - 2);
     for (k = 0; k < CHAT_ROWS_MAX; k++) chat_row_line[k] = -1;
 
@@ -945,6 +965,7 @@ const char *const lc_cmd_help[][4] = {
     {"search", "find", "Search messages", "/search [query]"},
     {"draw", "whiteboard,art", "Open the drawing whiteboard (or join art:<name>)", "/draw [channel]"},
     {"files", "file,share", "Open the file sharing browser", "/files"},
+    {"view", "picture", "Preview a shared picture", "/view <number>"},
     {"settings", "", "Open the settings", "/settings"},
     {"voice", "vc", "Voice channel commands", "/voice [join <channel> | leave]"},
     {"deafen", "deaf", "Deafen (mute audio output)", "/deafen"},
@@ -1033,18 +1054,41 @@ int lc_slash_ghost(const char *input, const int *idx, int n)
     return term[i] == '\0' ? idx[0] : -1;
 }
 
-int lc_slash_exact(const char *input, int cmd)
+/* 1 when input (after leading spaces, before trailing ones) is exactly "/" + the n bytes of word. */
+static int slash_is(const char *input, const char *word, int n)
 {
     int i = 0;
-    const char *name = lc_cmd_help[cmd][0];
     while (input[0] == ' ') input++;
     if (input[0] != '/') return 0;
     input++;
-    while (name[i] != '\0' && lower(input[i]) == lower(name[i])) i++;
-    if (name[i] != '\0') return 0;
+    while (i < n && input[i] != '\0' && lower(input[i]) == lower(word[i])) i++;
+    if (i < n) return 0;
     input += i;
     while (*input == ' ') input++;
     return *input == '\0';
+}
+
+int lc_slash_exact(const char *input, int cmd)
+{
+    const char *name = lc_cmd_help[cmd][0];
+    return slash_is(input, name, (int)strlen(name));
+}
+
+int lc_slash_complete(const char *input)
+{
+    int i;
+    for (i = 0; i < lc_cmd_help_count; i++) {
+        const char *a = lc_cmd_help[i][1];
+        if (lc_slash_exact(input, i)) return 1;
+        while (*a != '\0') {                              /* comma-separated alias list */
+            int n = 0;
+            while (a[n] != '\0' && a[n] != ',') n++;
+            if (n > 0 && slash_is(input, a, n)) return 1;
+            a += n;
+            if (*a == ',') a++;
+        }
+    }
+    return 0;
 }
 
 int lc_slash_scroll(int sel, int top, int n)
@@ -1590,8 +1634,141 @@ static void draw_theme(ui_cells *c, const lc_model *m)
     ui_cells_pen(c, LC_INK, UI_CELLS_DEFAULT, 0);
 }
 
+/* ---- the /draw pen picker ---- */
+
+static int lcpk_cols(int page) { return page == LC_PICK_CHAR ? 16 : 8; }
+static int lcpk_count(int page) { return page == LC_PICK_CHAR ? LC_PICK_CHARS : 16; }
+static int lcpk_cell_w(int page) { return page == LC_PICK_CHAR ? 1 : 2; }
+static int lcpk_grid_rows(int page) { return page == LC_PICK_CHAR ? 12 : 2; }
+
+int lc_pick_char(int i)
+{
+    return i < 95 ? 0x20 + i : 0xA0 + (i - 95);
+}
+
+void lc_pick_open(lc_model *m)
+{
+    int i;
+    lc_pick *p = &m->dr_pick;
+    p->open = 1;
+    p->page = LC_PICK_CHAR;
+    p->cur[LC_PICK_FORE] = m->dr_fg & 15;
+    p->cur[LC_PICK_BACK] = m->dr_bg & 15;
+    p->cur[LC_PICK_CHAR] = 0;
+    for (i = 0; i < LC_PICK_CHARS; i++) if (lc_pick_char(i) == m->dr_ch) p->cur[LC_PICK_CHAR] = i;
+    p->top = m->rows > 19 ? 1 : 0;
+    p->left = m->cols > LC_PICK_W ? (m->cols - LC_PICK_W) / 2 : 0;
+}
+
+static void pick_apply(lc_model *m)
+{
+    lc_pick *p = &m->dr_pick;
+    if (p->page == LC_PICK_FORE) m->dr_fg = p->cur[LC_PICK_FORE];
+    else if (p->page == LC_PICK_BACK) m->dr_bg = p->cur[LC_PICK_BACK];
+    else m->dr_ch = lc_pick_char(p->cur[LC_PICK_CHAR]);
+}
+
+int lc_pick_key(lc_model *m, int key)
+{
+    lc_pick *p = &m->dr_pick;
+    int *cur = &p->cur[p->page], cols = lcpk_cols(p->page), n = lcpk_count(p->page), t = *cur;
+    if (key == UI_KEY_ESC || key == 'h') { p->open = 0; return 0; }
+    if (key == UI_KEY_ENTER || key == '\r' || key == '\n' || key == ' ') { pick_apply(m); return 1; }
+    if (key == '\t') { p->page = (p->page + 1) % 3; return 0; }
+    if (key == UI_KEY_BACKTAB) { p->page = (p->page + 2) % 3; return 0; }
+    if (key == UI_KEY_LEFT) t--;
+    else if (key == UI_KEY_RIGHT) t++;
+    else if (key == UI_KEY_UP) t -= cols;
+    else if (key == UI_KEY_DOWN) t += cols;
+    if (t >= 0 && t < n) *cur = t;
+    return 0;
+}
+
+int lc_pick_click(lc_model *m, int row, int col)
+{
+    lc_pick *p = &m->dr_pick;
+    int r = row - p->top - 2, c = col - p->left - 1, cw, i;
+    if (row < p->top || row >= p->top + 3 + lcpk_grid_rows(p->page) || col < p->left || col >= p->left + LC_PICK_W) { p->open = 0; return 0; }
+    if (row == p->top + 1) {
+        if (c >= 0 && c < 4) p->page = LC_PICK_FORE;
+        else if (c >= 5 && c < 9) p->page = LC_PICK_BACK;
+        else if (c >= 10 && c < 14) p->page = LC_PICK_CHAR;
+        return 0;
+    }
+    cw = lcpk_cell_w(p->page);
+    if (r < 0 || r >= lcpk_grid_rows(p->page) || c < 0 || c >= lcpk_cols(p->page) * cw) return 0;
+    i = r * lcpk_cols(p->page) + c / cw;
+    if (i >= lcpk_count(p->page)) return 0;
+    p->cur[p->page] = i;
+    pick_apply(m);
+    return 1;
+}
+
+static void pick_draw(ui_cells *c, const lc_model *m)
+{
+    const lc_pick *p = &m->dr_pick;
+    static const char *const tab[3] = { "Fore", "Back", "Char" };
+    int h = 3 + lcpk_grid_rows(p->page), cw = lcpk_cell_w(p->page), cols = lcpk_cols(p->page), i, k;
+    ui_cells_pen(c, LC_INK, UI_CELLS_DEFAULT, 0);
+    ui_cells_fill(c, p->top + 1, p->left + 1, h - 2, LC_PICK_W - 2, ' ');
+    ui_cells_box(c, p->top, p->left, h, LC_PICK_W, LC_ACCENT, 0, 0);
+    for (k = 0; k < 3; k++) {
+        ui_cells_pen(c, k == p->page ? LC_INK : LC_ACCENT, k == p->page ? LC_ACCENT : UI_CELLS_DEFAULT, 0);
+        ui_cells_text(c, p->top + 1, p->left + 1 + k * 5, tab[k], 4);
+    }
+    for (i = 0; i < lcpk_count(p->page); i++) {
+        int row = p->top + 2 + i / cols, col = p->left + 1 + (i % cols) * cw, sel = i == p->cur[p->page];
+        if (p->page == LC_PICK_CHAR) {
+            ui_cells_pen(c, sel ? 0 : LC_INK, sel ? LC_ACCENT : UI_CELLS_DEFAULT, 0);
+            ui_cells_put(c, row, col, lc_pick_char(i));
+        } else {
+            ui_cells_pen(c, i < 9 ? 15 : 0, i == 0 ? UI_CELLS_DEFAULT : i, 0);
+            ui_cells_put(c, row, col, sel ? '>' : ' ');
+            ui_cells_put(c, row, col + 1, "0123456789ABCDEF"[i]);
+        }
+    }
+    ui_cells_pen(c, UI_CELLS_DEFAULT, UI_CELLS_DEFAULT, 0);
+}
+
+/** The /draw view (plan D1): canvas rows 0..23 from the model's scroll offset, the status bar below.
+ *  A caller narrower than 80 columns sees a window the cursor drags along. The cursor goes to the
+ *  terminal caret. */
+static void lc_draw_canvas(ui_cells *c, const lc_model *m, int *cursor_row, int *cursor_col)
+{
+    int W = c->cols, H = c->rows, vw = W < UI_CANVAS_COLS ? W : UI_CANVAS_COLS, vh = H - 1 < UI_CANVAS_ROWS ? H - 1 : UI_CANVAS_ROWS;
+    int r, k;
+    char status[160];
+
+    ui_hit_reset(&lc_hits);
+    ui_cells_pen(c, UI_CELLS_DEFAULT, UI_CELLS_DEFAULT, 0);
+    ui_cells_fill(c, 0, 0, H, W, ' ');
+    for (r = 0; r < vh; r++) {
+        for (k = 0; k < vw; k++) {
+            ui_cell cell;
+            ui_canvas_get(m->canvas, m->dr_left + k, m->dr_top + r, &cell);
+            ui_cells_pen(c, cell.fg, cell.bg == 0 ? UI_CELLS_DEFAULT : cell.bg, 0);
+            ui_cells_put(c, r, k, (unsigned char)cell.ch < 32 ? ' ' : (unsigned char)cell.ch);
+        }
+    }
+    ui_hit_add(&lc_hits, LC_HIT_CANVAS, 0, 0, vh, vw);
+    sprintf(status, "%.12s | pen %c fg %d bg %d | %d,%d | %.30s", m->dr_tool, m->dr_ch < 32 ? ' ' : m->dr_ch, m->dr_fg, m->dr_bg,
+            m->dr_x, m->dr_y, m->dr_note[0] != '\0' ? m->dr_note : "Space paint, T tools, H pen, Esc back");
+    ui_cells_bar(c, H - 1, 0, W, status, LC_INK, UI_CELLS_DEFAULT, 0);
+    if (m->dr_pop.open) {
+        ui_popup_draw(c, &m->dr_pop, LC_ACCENT, LC_INK, LC_ACCENT, LC_ALERT);
+        ui_hit_add(&lc_hits, LC_HIT_POPUP, m->dr_pop.top, m->dr_pop.left, m->dr_pop.n + 2, m->dr_pop.w);
+    }
+    if (m->dr_pick.open) {
+        pick_draw(c, m);
+        ui_hit_add(&lc_hits, LC_HIT_POPUP, m->dr_pick.top, m->dr_pick.left, 3 + lcpk_grid_rows(m->dr_pick.page), LC_PICK_W);
+    }
+    *cursor_row = m->dr_y - m->dr_top;
+    *cursor_col = m->dr_x - m->dr_left;
+}
+
 void lc_draw(ui_cells *c, const lc_model *m, int *cursor_row, int *cursor_col)
 {
+    if (m->draw && m->canvas != 0 && m->modal == LC_MODAL_NONE) { lc_draw_canvas(c, m, cursor_row, cursor_col); return; }
     int W = c->cols, H = c->rows, sw = lc_sidebar_width(m), h = H - 5;
     char status[160];
     int k;

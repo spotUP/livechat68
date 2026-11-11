@@ -93,6 +93,7 @@ ae_caps_t ae_caps_parse(const char *caps)
     if (caps_has(caps, "c64adapt")) bits |= AE_CAP_C64ADAPT;
     if (caps_has(caps, "wide"))     bits |= AE_CAP_WIDE;
     if (caps_has(caps, "mouse"))    bits |= AE_CAP_MOUSE;
+    if (caps_has(caps, "kitty"))    bits |= AE_CAP_KITTY;
 
     return bits;
 }

@@ -416,6 +416,19 @@ static void chat_reply(int fd, int status, const char *type, const char *body)
     (void)!write(fd, body, (size_t)len);
 }
 
+/* A PNG body with NUL bytes (IHDR 64x48), served as preview.png with the hub's X-Cells header. */
+static void chat_reply_png(int fd)
+{
+    static const unsigned char png[] = {
+        0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13, 'I', 'H', 'D', 'R',
+        0, 0, 0, 64, 0, 0, 0, 48, 8, 2, 0, 0, 0, 0x11, 0x22, 0x33, 0x44, 0, 0, 0, 0, 'I', 'E', 'N', 'D' };
+    char head[200];
+    int hl = sprintf(head, "HTTP/1.1 200 X\r\nContent-Type: image/png\r\nX-Cells: 12x4\r\nContent-Length: %d\r\nConnection: close\r\n\r\n",
+                     (int)sizeof png);
+    (void)!write(fd, head, (size_t)hl);
+    (void)!write(fd, png, sizeof png);
+}
+
 static void chat_copy_json_field(char *dst, int cap, const char *body, const char *key)
 {
     char pat[48];
@@ -545,6 +558,28 @@ static void chat_serve(int fd, stub_chat_stats *st, int *state)
         st->room_motd_puts++;
         sprintf(st->pending_row, "room_motd|lobby|Tester||1700000500|0|%s", st->room_motd);
         chat_reply(fd, 200, "application/json", "{\"ok\":true}");
+    } else if (is_get && strncmp(path, "/chat/v1/rooms/", 15) == 0 && strstr(path, "/canvas.txt") != 0) {
+        /* GET /rooms/:id/canvas.txt: CANVAS|1|rev|rows, then the rows the test set */
+        char reply[1500];
+        st->canvas_get_calls++;
+        if (strstr(path, "from=0") != 0) sprintf(reply, "CANVAS|1|%d|%d\n%s", (int)st->canvas_rev, st->canvas_row_count, st->canvas_rows);
+        else sprintf(reply, "CANVAS|1|%d|0\n", (int)st->canvas_rev);          /* a later page: the test's rows were all on page one */
+        if (st->canvas_inject[0] != '\0') {
+            st->canvas_rev++;
+            sprintf(st->pending_row, "canvas|paint|Alice|%d|1700000500|0|%s", (int)st->canvas_rev, st->canvas_inject);
+            st->canvas_inject[0] = '\0';
+        }
+        chat_reply(fd, 200, "text/plain", reply);
+    } else if (is_post && strncmp(path, "/chat/v1/rooms/", 15) == 0 && strstr(path, "/canvas") != 0) {
+        /* POST /rooms/:id/canvas {base, ops}: logged, rev bumped, not noted (a typed command keeps last_write_path) */
+        char ops[560], reply[64];
+        chat_copy_json_field(ops, sizeof ops, body, "ops");
+        st->canvas_post_calls++;
+        st->canvas_rev++;
+        strncpy(st->last_canvas_body, body, sizeof st->last_canvas_body - 1);
+        if (strlen(st->canvas_post_log) + strlen(ops) + 2 < sizeof st->canvas_post_log) { strcat(st->canvas_post_log, ops); strcat(st->canvas_post_log, "|"); }
+        sprintf(reply, "{\"rev\":%d}", (int)st->canvas_rev);
+        chat_reply(fd, 200, "application/json", reply);
     } else if (is_post && strncmp(path, "/chat/v1/rooms/", 15) == 0 && strstr(path, "/typing") != 0) {
         /* POST /rooms/:id/typing (D3): logged, not noted, so a typed command keeps last_write_path */
         char text[220];
@@ -681,6 +716,13 @@ static void chat_serve(int fd, stub_chat_stats *st, int *state)
     } else if (is_post && strstr(path, "/leave") != 0) {
         st->leaves++;
         chat_reply(fd, 204, "text/plain", "");
+    } else if (is_get && strstr(path, "/files/") != 0 && strstr(path, "/preview.png") != 0) {
+        st->previews++;
+        chat_reply_png(fd);
+    } else if (is_get && strstr(path, "/rooms/") != 0 && strstr(path, "/files.txt") != 0) {
+        chat_reply(fd, 200, "text/plain", st->files_pic
+                   ? "FILES|1|9|1\r\nf77|sunset.png|182000|alice|1700000030|sunset|image|64|48\r\n"
+                   : "FILES|1|9|0\r\n");
     } else if (is_get && strstr(path, "/rooms/") != 0 && strstr(path, "/history.txt") != 0) {
         st->histories++;
         chat_reply(fd, 200, "text/plain",

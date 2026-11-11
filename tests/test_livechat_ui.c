@@ -405,7 +405,7 @@ static int slash_menu_rules(void)
     n = lc_slash_match("/mute", idx, LC_SLASH_MAX);          /* prefix first (mute), then description matches (unmute: "Unmute user") */
     if (n < 2 || strcmp(lc_cmd_help[idx[0]][0], "mute") != 0 || strcmp(lc_cmd_help[idx[1]][0], "deafen") != 0) { printf("slash: /mute order\n"); fail = 1; }
     n = lc_slash_match("/pin", idx, LC_SLASH_MAX);            /* a TS command the door does not run yet is still listed */
-    if (n < 3 || strcmp(lc_cmd_help[idx[0]][0], "pin") != 0 || strcmp(lc_cmd_help[idx[1]][0], "pinned") != 0 || lc_cmd_help_count != 57) { printf("slash: /pin n=%d count=%d\n", n, lc_cmd_help_count); fail = 1; }
+    if (n < 3 || strcmp(lc_cmd_help[idx[0]][0], "pin") != 0 || strcmp(lc_cmd_help[idx[1]][0], "pinned") != 0 || lc_cmd_help_count != 58) { printf("slash: /pin n=%d count=%d\n", n, lc_cmd_help_count); fail = 1; }
     n = lc_slash_match("/reaction", idx, LC_SLASH_MAX);
     if (n < 1 || strcmp(lc_cmd_help[idx[0]][0], "reactions") != 0) { printf("slash: /reaction first\n"); fail = 1; }
     n = lc_slash_match("/Away", idx, LC_SLASH_MAX);
@@ -424,6 +424,9 @@ static int slash_menu_rules(void)
     lc_slash_row(row, sizeof row, 2, 20, &uc, &ul);           /* create: cut to max(8, cols-4) = 16 */
     if (strlen(row) != 16) { printf("slash: compact cut %d\n", (int)strlen(row)); fail = 1; }
     if (!lc_slash_exact("/join", 10) || lc_slash_exact("/joi", 10) || lc_slash_exact("/join x", 10) || !lc_slash_exact("/JOIN ", 10)) { printf("slash: exact\n"); fail = 1; }
+    /* "/share" is an alias of /files; /view lists too ("Preview a shared picture"). Enter must run it. */
+    if (!lc_slash_complete("/share") || !lc_slash_complete("/file ") || !lc_slash_complete("/files") || !lc_slash_complete("/PICTURE")
+        || lc_slash_complete("/shar") || lc_slash_complete("/share x") || lc_slash_complete("/nosuchcmd")) { printf("slash: complete\n"); fail = 1; }
     if (lc_slash_scroll(0, 0, 35) != 0 || lc_slash_scroll(8, 0, 35) != 1 || lc_slash_scroll(2, 5, 35) != 2 || lc_slash_scroll(34, 0, 35) != 27 || lc_slash_scroll(3, 0, 5) != 0) { printf("slash: scroll\n"); fail = 1; }
     return fail;
 }
@@ -552,9 +555,100 @@ static int colours_match_ts(void)
     return bad;
 }
 
+/* C6: the /draw view. Canvas cells paint at the cell's palette colours, the cursor is the caret, the
+ * status bar is the last row, and a 40-column caller sees a window scrolled by dr_left. */
+static ui_canvas draw_cv;
+
+static int draw_canvas_view(void)
+{
+    static lc_model m;
+    ui_cells c;
+    int fail = 0, cr = 0, cc = 0;
+    ui_cell cell = {'Z', 12, 4, 0};
+
+    ui_canvas_clear(&draw_cv);
+    ui_canvas_set(&draw_cv, 10, 5, cell);
+    ui_canvas_set(&draw_cv, 60, 7, cell);
+    lc_model_init(&m, 80, 25);
+    m.draw = 1; m.canvas = &draw_cv; m.dr_x = 10; m.dr_y = 5; m.dr_fg = 9; m.dr_bg = 2; m.dr_ch = '#';
+    strcpy(m.dr_tool, "Draw");
+    if (ui_cells_open(&c, 80, 25) != 0) return 1;
+    lc_draw(&c, &m, &cr, &cc);
+    if (c.back[5 * 80 + 10].ch != 'Z' || c.back[5 * 80 + 10].fg != 12 || c.back[5 * 80 + 10].bg != 4) { printf("draw 80: sentinel cell wrong\n"); fail = 1; }
+    if (c.back[5 * 80 + 11].ch != ' ') { printf("draw 80: blank cell wrong\n"); fail = 1; }
+    if (cr != 5 || cc != 10) { printf("draw 80: caret %d,%d\n", cr, cc); fail = 1; }
+    if (c.back[24 * 80].ch != 'D' || c.back[24 * 80 + 1].ch != 'r') { printf("draw 80: status row not 'Draw ...'\n"); fail = 1; }
+    ui_cells_close(&c);
+
+    m.dr_left = 40; m.dr_x = 60; m.dr_y = 7;     /* 40 columns: the window starts at canvas column 40 */
+    lc_model_init(&m, 40, 25);
+    m.draw = 1; m.canvas = &draw_cv; m.dr_left = 40; m.dr_x = 60; m.dr_y = 7; strcpy(m.dr_tool, "Draw");
+    if (ui_cells_open(&c, 40, 25) != 0) return 1;
+    lc_draw(&c, &m, &cr, &cc);
+    if (c.back[7 * 40 + 20].ch != 'Z') { printf("draw 40: scrolled sentinel missing\n"); fail = 1; }
+    if (c.back[5 * 40 + 10].ch == 'Z') { printf("draw 40: unscrolled cell leaked into the window\n"); fail = 1; }
+    if (cr != 7 || cc != 20) { printf("draw 40: caret %d,%d\n", cr, cc); fail = 1; }
+    ui_cells_close(&c);
+    return fail;
+}
+
+/* The picker popup: the Char page holds 0x20-0x7E then 0xA0-0xFF, clicking a cell applies it, and it fits 40 columns. */
+static int draw_pick_view(void)
+{
+    static lc_model m;
+    ui_cells c;
+    int fail = 0, cr = 0, cc = 0, row, col;
+
+    lc_model_init(&m, 40, 25);
+    m.draw = 1; m.canvas = &draw_cv; strcpy(m.dr_tool, "Draw");
+    m.dr_fg = 15; m.dr_bg = 0; m.dr_ch = '#';
+    lc_pick_open(&m);
+    if (!m.dr_pick.open || m.dr_pick.left + LC_PICK_W > 40) { printf("pick: not open or wider than 40 columns\n"); fail = 1; }
+    if (ui_cells_open(&c, 40, 25) != 0) return 1;
+    lc_draw(&c, &m, &cr, &cc);
+    /* the cell for index 95 (0xA0) is row 5 col 15 of the grid: the popup shows it as drawn */
+    row = m.dr_pick.top + 2 + 95 / 16; col = m.dr_pick.left + 1 + 95 % 16;
+    if ((unsigned char)c.back[row * 40 + col].ch != 0xA0) { printf("pick: 0xA0 not drawn at its cell\n"); fail = 1; }
+    if (lc_pick_click(&m, row + 0, col) != 1 || m.dr_ch != 0xA0) { printf("pick: click did not apply 0xA0\n"); fail = 1; }
+    row = m.dr_pick.top + 2 + 190 / 16; col = m.dr_pick.left + 1 + 190 % 16;
+    if (lc_pick_click(&m, row, col) != 1 || m.dr_ch != 0xFF) { printf("pick: click did not apply 0xFF\n"); fail = 1; }
+    m.dr_pick.page = LC_PICK_BACK;
+    if (lc_pick_click(&m, m.dr_pick.top + 2 + 1, m.dr_pick.left + 1 + 2 * 3) != 1 || m.dr_bg != 11) { printf("pick: back colour click gave %d\n", m.dr_bg); fail = 1; }
+    lc_pick_click(&m, 0, 0);
+    if (m.dr_pick.open) { printf("pick: click outside did not close\n"); fail = 1; }
+    ui_cells_close(&c);
+    return fail;
+}
+
+/* TS textbox.ts (b52cfd5ea): a line longer than the input box scrolls sideways, so the newest
+ * text and the cursor stay inside the box. Type past the width, then step the cursor home. */
+static int long_input_scrolls(void)
+{
+    static lc_model m;
+    ui_cells c;
+    int cr, cc, i, n, iw, row, bad = 0;
+    char shown[4];
+    main_state(&m, 80, 25);
+    m.focus = LC_FOCUS_INPUT;
+    for (n = 0; n < 150; n++) m.input[n] = (char)('a' + n % 26);
+    memcpy(m.input + n, "END", 3); n += 3; m.input[n] = '\0';
+    m.input_cur = n;
+    if (ui_cells_open(&c, 80, 25) != 0) return 1;
+    lc_draw(&c, &m, &cr, &cc);
+    iw = c.cols - 6; row = c.rows - 3;
+    for (i = 0; i < 3; i++) shown[i] = (char)c.back[row * c.cols + cc - 3 + i].ch;
+    shown[3] = '\0';
+    if (cr != row || cc < 1 || cc > iw - 2 || strcmp(shown, "END") != 0) { printf("FAIL long input end: cursor %d,%d shown '%s'\n", cr, cc, shown); bad = 1; }
+    m.input_cur = 0;
+    lc_draw(&c, &m, &cr, &cc);
+    if (cc != 1 || c.back[row * c.cols + 1].ch != 'a') { printf("FAIL long input home: cursor col %d first '%c'\n", cc, c.back[row * c.cols + 1].ch); bad = 1; }
+    ui_cells_close(&c);
+    return bad;
+}
+
 int main(void)
 {
-    int r = chat_cache_and_pane_fill() | react_rows_under_the_message() | stamps_follow_the_pref() | active_panel_is_highlighted() | picker_selects_and_draws() | slash_menu_rules() | message_formatting() | event_line_marks() | system_line_tone() | format_picker_model() | theme_menu_columns() | colours_match_ts();
+    int r = chat_cache_and_pane_fill() | react_rows_under_the_message() | stamps_follow_the_pref() | active_panel_is_highlighted() | picker_selects_and_draws() | slash_menu_rules() | message_formatting() | event_line_marks() | system_line_tone() | format_picker_model() | theme_menu_columns() | colours_match_ts() | draw_canvas_view() | draw_pick_view() | long_input_scrolls();
     int a = compare("tests/fixtures/lc68-ts-main-80x25.grid");
     int b = compare("tests/fixtures/lc68-ts-main-40x25.grid");
     int d = compare("tests/fixtures/lc68-ts-main-80x15.grid");

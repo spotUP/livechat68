@@ -45,6 +45,7 @@
 #include "ae_chat.h"
 #include "ae_chatprefs.h"
 #include "ae_host.h"
+#include "ae_kitty.h"
 #include "ae_http.h"
 #include "ae_net.h"
 #include "ae_request.h"
@@ -54,6 +55,7 @@
 #include "ui_cells.h"
 #include "ui_input.h"
 #include "ui_key.h"
+#include "ui_paint.h"
 #include "ui_screen.h"
 #include "ui_theme.h"
 #include "livechat_ui.h"
@@ -369,6 +371,17 @@ static void load_ignores(void)
 }
 
 /** A message, inserted by seq among the messages; one already shown (same id) is not shown twice. */
+/** An epoch the hub sent (seconds, or milliseconds: the first ten digits) as seconds; 0 when it is not a number. */
+static long epoch_of(const char *epoch)
+{
+    char digits[12];
+    size_t n = strlen(epoch);
+    if (n > 10) n = 10;
+    memcpy(digits, epoch, n);
+    digits[n] = '\0';
+    return atol(digits);
+}
+
 static lc_line *add_message(int kind, long seq, const char *id, const char *nick, const char *label, const char *at,
                             const char *text, const char *reply_to)
 {
@@ -391,6 +404,7 @@ static lc_line *add_message(int kind, long seq, const char *id, const char *nick
     clean(l->label, sizeof l->label, label);
     clean(l->text, sizeof l->text, text);
     hhmm_of(l->time, at);
+    l->epoch = epoch_of(at);
     copy(l->quote, sizeof l->quote, quote);
     M.scroll = 0;
     return l;
@@ -524,17 +538,20 @@ static void open_help(void)
 
 /* ---- the screen --------------------------------------------------------- */
 
+static void pics_update(void);
+
 static void present(void)
 {
     int cr = 0, cc = 0;
     if (M.ntyping > 0) hhmm_now(M.typing_time);
-    int caret = M.focus == LC_FOCUS_INPUT && !M.help && !M.view && M.menu < 0 && !M.settings && !M.theme
+    int caret = M.draw && M.modal == LC_MODAL_NONE ? 1 : M.focus == LC_FOCUS_INPUT && !M.help && !M.view && M.menu < 0 && !M.settings && !M.theme
                 && (M.modal == LC_MODAL_NONE || M.modal == LC_MODAL_PROMPT);
     lc_draw(&cells, &M, &cr, &cc);
     ui_cells_flush(&cells, &screen.buf, drain, 0);
     ui_screen_cursor(&screen, caret);
     if (caret) ansi_goto(&screen.buf, cr + 1, cc + 1);
     ui_screen_flush(&screen);
+    pics_update();
 }
 
 /* ---- per-room sidebar state: TS expandedChannels, collapsedChannels, pinned channels, unreadCount ---- */
@@ -846,6 +863,16 @@ static void take_bbs_event(const char *at, const char *node, const char *user, c
         sprintf(body, " %s %.100s%s%s%.80s", up ? "uploaded" : "downloaded", a, kb,
                 c[0] == '\0' ? "" : up ? " to " : " from ", c);
         add_event(at, up ? LC_EV_BAR : LC_TK_ACCENT_ALT, head, 0, body, 0);
+    } else if (strcmp(type, "system_notice") == 0) {
+        /* The board's SYSTEM UPDATE countdown, relayed through the hub to this
+         * board's callers only (events.ts filters bbs events by board). The
+         * board keeps its raw-text copy off LC's screen (rendersEvents in
+         * door.settings.json), so this log line is the caller's warning. */
+        ae_req_form_value(data, "message", a, sizeof a);
+        if (a[0] != '\0') {
+            sprintf(body, "*** %.180s ***", a);
+            system_line(body);
+        }
     } else if (strcmp(type, "door_activity") == 0) {
         int entered;
         ae_req_form_value(data, "action", a, sizeof a);
@@ -972,6 +999,83 @@ static void typing_reset(void)
     M.ntyping = 0;
 }
 
+/* ---- the /draw canvas (plan C7): the hub's shared 80x24 grid of an art room ----
+ * The grid and the dirty bitmap are static: ui_canvas is 7.7 KB, too big for the 68K stack. The
+ * pen's undo store (about 68 KB) is allocated the first time /draw opens: as static BSS it pushed
+ * the hunk past the board emulator's 0x7f000 door ceiling and the door would not load at all.
+ * Without the memory /draw still works, with no undo. dr_rev is the revision the grid shows. */
+static ui_canvas dr_cv;
+static ui_paint_undo *dr_undo;
+static ui_paint dr_paint;
+static unsigned char dr_dirty[UI_CANVAS_CELLS];
+static int dr_any;            /* a cell is waiting in dr_dirty to be posted */
+static long dr_rev;
+static int dr_resync;         /* an event skipped a revision: fetch the snapshot again */
+
+static void dr_mark(void *user, int x, int y, ui_cell cell)
+{
+    IGNORE(user);
+    IGNORE(&cell);
+    dr_dirty[y * UI_CANVAS_COLS + x] = 1;
+    dr_any = 1;
+}
+
+/** The whole snapshot, a page at a time (the hub stops a reply at 7680 bytes). Ops are idempotent, so
+ *  keeping the first page's revision and replaying the events that follow it is safe. */
+static void dr_fetch(void)
+{
+    int from = 0, guard;
+    long rev = dr_rev, page;
+    ui_canvas_clear(&dr_cv);
+    for (guard = 0; guard < UI_CANVAS_ROWS && from < UI_CANVAS_ROWS; guard++) {
+        int got;
+        if (ae_chat_canvas_get(&chat, room_id, from, UI_CANVAS_ROWS - from) != AE_CHAT_OK) break;
+        got = ui_canvas_parse_reply(&dr_cv, chat.reply, (int)chat.reply_len, &page);
+        if (got <= 0) break;
+        if (from == 0) rev = page;   /* the first page's revision: events after it replay over the later pages */
+        from += got;
+    }
+    dr_rev = rev;
+    dr_resync = 0;
+}
+
+/** A canvas event (hub: ref = the new revision, text = the ops). The own post's echo is at or below
+ *  dr_rev already; the next revision applies; a gap or bad ops ask for the snapshot, fetched once the
+ *  event rows are read (they share the reply buffer). */
+static void dr_event(long ref, const char *ops)
+{
+    if (ref <= dr_rev) return;
+    if (ref != dr_rev + 1 || ui_canvas_apply(&dr_cv, ops, (int)strlen(ops), 1920, 0) != UI_CANVAS_APPLY_OK) { dr_resync = 1; return; }
+    dr_rev = ref;
+}
+
+/* Pictures and files the hub announced this session (TS features/chat-pictures.ts: files[], 1-based /view N). */
+#define LC_SHARED_MAX 64
+typedef struct { char id[32]; char name[64]; char kind[12]; } lc_shared;
+static lc_shared shared_files[LC_SHARED_MAX];
+static int shared_n;
+
+/** TS parseFileShared: the event text is "name|size|kind" (or "name!size!kind"); the file id is the row's ref. */
+static int shared_add(const char *id, const char *text)
+{
+    char buf[160], *p, *q;
+    lc_shared *f;
+    if (id[0] == '\0' || shared_n >= LC_SHARED_MAX) return -1;
+    f = &shared_files[shared_n];
+    copy(f->id, sizeof f->id, id);
+    copy(buf, sizeof buf, text);
+    p = buf;
+    q = strpbrk(p, "|!");
+    if (q) *q++ = '\0';
+    copy(f->name, sizeof f->name, p);
+    f->kind[0] = '\0';
+    if (q && (q = strpbrk(q, "|!")) != 0) copy(f->kind, sizeof f->kind, q + 1);
+    return ++shared_n;
+}
+
+#define HISTORY_LIMIT 30                       /* the history page the door asks for (TS HISTORY_LIMIT) */
+static int pic_insert(int pos, const char *fid);
+
 static void take_events(void)
 {
     char *f[AE_CHAT_ROW_FIELDS];
@@ -1030,6 +1134,8 @@ static void take_events(void)
             if (room_motd[0] != '\0') sprintf(line, "[MOTD] %.200s", room_motd);
             else strcpy(line, "[MOTD] cleared");
             motd_line(line);
+        } else if (strcmp(type, "canvas") == 0 && in_room && M.draw) {
+            dr_event(atol(ref), f[7]);
         } else if (strcmp(type, "typing") == 0 && in_room) {
             if (!is_self(user) && show_typing) typing_set(user, f[7]);   /* own events: the local echo has them */
         } else if (strcmp(type, "mode") == 0 && in_room && f[7][0] != '\0') {
@@ -1050,6 +1156,14 @@ static void take_events(void)
             system_line("You have been muted");
         } else if (strcmp(type, "bbs") == 0) {
             take_bbs_event(f[5], room, user, ref, f[7]);
+        } else if (strcmp(type, "file_shared") == 0) {
+            /* TS server.ts file:shared: only a picture says anything; "<user> shared a picture: NAME (/view)  #N [PICTURE] NAME" */
+            int n = shared_add(ref, f[7]);
+            if (n > 0 && strcmp(shared_files[n - 1].kind, "image") == 0) {
+                sprintf(line, "%.30s shared a picture: %.60s (/view)  #%d [PICTURE] %.60s", user, shared_files[n - 1].name, n, shared_files[n - 1].name);
+                system_line(line);
+                pic_insert(M.nlines, shared_files[n - 1].id);
+            }
         } else if (strcmp(type, "board_joined") == 0 && f[7][0] != '\0') {
             /* hub board_joined (no room): a new board registered; web chat says the same (chat-session-bridge) */
             sprintf(line, "%.80s joined the federation", f[7]);
@@ -1057,6 +1171,7 @@ static void take_events(void)
         }
     }
     for (i = 0; i < nreacted; i++) load_reactions(reacted[i]);
+    if (dr_resync && M.draw) dr_fetch();
 }
 
 /* TS server.ts disconnection modal: MAX is doorSettings.reconnectAttempts (default 3); the C door has no such setting. */
@@ -1125,6 +1240,8 @@ static int react_on(const char *msg_id, const char *emoji)
 /* ---- rooms and DMs ------------------------------------------------------ */
 
 /** Reads history rows (seq|id|user|at|replyTo|threadId|roleColor|text), after a "--- n earlier ---" marker. */
+static int pictures_into_history(int marker, int nhist, int limit);
+
 static void take_history(void)
 {
     char *f[AE_CHAT_ROW_FIELDS];
@@ -1134,6 +1251,7 @@ static void take_history(void)
     while ((k = ae_chat_next_row(&chat, f, AE_CHAT_ROW_FIELDS)) >= AE_CHAT_ROW_MIN) {
         if (add_message(LC_HISTORY, atol(f[0]), f[1], f[2], k >= 9 ? f[8] : "", f[3], f[7], f[4]) != 0) n++;
     }
+    n += pictures_into_history(marker, n, HISTORY_LIMIT);
     if (n == 0) {                                  /* nothing earlier: no marker */
         int i;
         for (i = marker + 1; i < M.nlines; i++) M.lines[i - 1] = M.lines[i];
@@ -1163,12 +1281,249 @@ static const char *room_kind_of(const char *id)
     return "text";
 }
 
-#define LC_JOIN_REFUSED (-100)   /* a Voice or Art room: the door has neither yet */
+enum { DT_DRAW, DT_LINE, DT_BOX, DT_BOXF, DT_ELL, DT_ELLF, DT_FILL, DT_PICK, DT_TEXT, DT_CLEAR, DT_COUNT };
+static const char *const dr_tools[DT_COUNT] = { "Draw", "Line", "Box", "Filled Box", "Ellipse", "Filled Ellipse",
+                                                "Fill", "Pick Colour", "Text", "Clear Canvas" };
+static int dr_tool, dr_ax, dr_ay;
 
-/** TS opens the voice grid or the drawing canvas; telnet has neither yet (spot 2026-11-09). */
-static int refuse_kind(const char *kind)
+static void dr_note(const char *text) { copy(M.dr_note, sizeof M.dr_note, text); }
+
+static void dr_fail(int rc)
 {
-    system_line(strcmp(kind, "voice") == 0 ? "Voice channels are not on Amiga yet." : "Art channels are not on Amiga yet.");
+    char t[sizeof M.dr_note];
+    sprintf(t, "Not sent: %.30s", chat.error[0] != '\0' ? chat.error : (rc == AE_CHAT_ERR_TRANSPORT ? "offline" : "refused"));
+    dr_note(t);
+}
+
+/** Posts every dirty cell as ops chunks of at most 512 bytes. A revision that is not base + 1 means
+ *  somebody else drew too: the snapshot is fetched once all chunks are out. */
+static void dr_flush(void)
+{
+    int pos = 0, len, gap = 0;
+    char ops[UI_CANVAS_OPS_MAX + 8];
+    if (!dr_any) return;
+    while ((len = ui_canvas_encode_ops(&dr_cv, dr_dirty, &pos, ops, UI_CANVAS_OPS_MAX)) > 0) {
+        long rev = 0, base = dr_rev;
+        int rc = ae_chat_canvas_post(&chat, room_id, base, ops, len, &rev);
+        if (rc != AE_CHAT_OK) { dr_fail(rc); break; }
+        if (rev != base + 1) gap = 1;
+        dr_rev = rev;
+    }
+    memset(dr_dirty, 0, sizeof dr_dirty);
+    dr_any = 0;
+    if (gap) dr_fetch();
+}
+
+static void dr_set_tool(int t)
+{
+    dr_tool = t;
+    M.dr_anchor = 0;
+    copy(M.dr_tool, sizeof M.dr_tool, dr_tools[t]);
+}
+
+static void dr_enter(void)
+{
+    ui_canvas_clear(&dr_cv);
+    if (!dr_undo) dr_undo = (ui_paint_undo *)malloc(sizeof *dr_undo);
+    if (dr_undo) ui_paint_undo_init(dr_undo);
+    dr_paint.cv = &dr_cv;
+    dr_paint.undo = dr_undo;
+    dr_paint.on_set = dr_mark;
+    dr_paint.user = 0;
+    memset(dr_dirty, 0, sizeof dr_dirty);
+    dr_any = 0;
+    dr_rev = 0;
+    dr_fetch();
+    M.canvas = &dr_cv;
+    M.draw = 1;
+    M.dr_x = M.dr_y = M.dr_left = M.dr_top = 0;
+    M.dr_fg = 15; M.dr_bg = 0; M.dr_ch = '#';
+    M.dr_down = 0;
+    M.dr_pop.open = 0; M.dr_pick.open = 0;
+    dr_note("");
+    dr_set_tool(DT_DRAW);
+}
+
+static void dr_leave(void)
+{
+    ui_paint_end(&dr_paint);
+    dr_flush();
+    M.draw = 0;
+    M.dr_pop.open = 0; M.dr_pick.open = 0;
+    M.dr_down = 0;
+}
+
+/** Keeps the cursor inside the window: a caller narrower than 80 columns scrolls. */
+static void dr_scroll(void)
+{
+    int vw = M.cols < UI_CANVAS_COLS ? M.cols : UI_CANVAS_COLS, vh = M.rows - 1 < UI_CANVAS_ROWS ? M.rows - 1 : UI_CANVAS_ROWS;
+    if (M.dr_x < M.dr_left) M.dr_left = M.dr_x;
+    if (M.dr_x >= M.dr_left + vw) M.dr_left = M.dr_x - vw + 1;
+    if (M.dr_y < M.dr_top) M.dr_top = M.dr_y;
+    if (M.dr_y >= M.dr_top + vh) M.dr_top = M.dr_y - vh + 1;
+}
+
+static void dr_move(int x, int y)
+{
+    if (x < 0) x = 0;
+    if (x >= UI_CANVAS_COLS) x = UI_CANVAS_COLS - 1;
+    if (y < 0) y = 0;
+    if (y >= UI_CANVAS_ROWS) y = UI_CANVAS_ROWS - 1;
+    M.dr_x = x;
+    M.dr_y = y;
+    dr_scroll();
+}
+
+static ui_cell dr_pen(void)
+{
+    ui_cell pen;
+    pen.ch = (unsigned char)M.dr_ch;
+    pen.fg = (unsigned char)M.dr_fg;
+    pen.bg = (unsigned char)M.dr_bg;
+    pen.flags = 0;
+    return pen;
+}
+
+/** The current tool at the cursor: a dot, a fill, a pick, or one corner of a shape. */
+static void dr_act(void)
+{
+    ui_cell pen = dr_pen();
+    int x = M.dr_x, y = M.dr_y;
+    switch (dr_tool) {
+    case DT_DRAW: ui_paint_dot(&dr_paint, x, y, pen); break;
+    case DT_FILL: ui_paint_fill(&dr_paint, x, y, pen); break;
+    case DT_PICK:
+        if (ui_paint_pick(&dr_cv, x, y, &pen)) { M.dr_fg = pen.fg; M.dr_bg = pen.bg; if (pen.ch != ' ') M.dr_ch = pen.ch; }
+        break;
+    case DT_LINE: case DT_BOX: case DT_BOXF: case DT_ELL: case DT_ELLF:
+        if (!M.dr_anchor) { dr_ax = x; dr_ay = y; M.dr_anchor = 1; dr_note("Move to the other corner, Space"); break; }
+        M.dr_anchor = 0;
+        dr_note("");
+        if (dr_tool == DT_LINE) ui_paint_line(&dr_paint, dr_ax, dr_ay, x, y, pen);
+        else if (dr_tool == DT_BOX) ui_paint_box(&dr_paint, dr_ax, dr_ay, x, y, pen);
+        else if (dr_tool == DT_BOXF) ui_paint_box_fill(&dr_paint, dr_ax, dr_ay, x, y, pen);
+        else if (dr_tool == DT_ELL) ui_paint_ellipse(&dr_paint, dr_ax, dr_ay, x, y, pen);
+        else ui_paint_ellipse_fill(&dr_paint, dr_ax, dr_ay, x, y, pen);
+        break;
+    default: break;
+    }
+}
+
+/** Clear is a hub op: the room owner or an op, else the hub answers forbidden. */
+static void dr_clear(void)
+{
+    long rev = 0;
+    int rc = ae_chat_canvas_post(&chat, room_id, dr_rev, "X", 1, &rev);
+    if (rc != AE_CHAT_OK) { dr_fail(rc); return; }
+    ui_canvas_clear(&dr_cv);
+    if (dr_undo) ui_paint_undo_init(dr_undo);
+    dr_rev = rev;
+}
+
+static void dr_pick_tool(int i)
+{
+    if (i == DT_CLEAR) dr_clear();
+    else if (i >= 0 && i < DT_COUNT) dr_set_tool(i);
+}
+
+static int draw_key(int key)
+{
+    int x = M.dr_x, y = M.dr_y, moved = 0, had;
+    dr_note("");
+    if (M.dr_pick.open) { lc_pick_key(&M, key); return 0; }
+    if (M.dr_pop.open) {
+        int pick = ui_popup_key(&M.dr_pop, key);
+        if (pick >= 0) dr_pick_tool(pick);
+        return 0;
+    }
+    if (key == 17) { dr_leave(); M.modal = LC_MODAL_QUIT; return 0; }
+    if (dr_tool == DT_TEXT && key >= 32 && key < 127) {
+        char s[2];
+        s[0] = (char)key; s[1] = '\0';
+        ui_paint_text(&dr_paint, x, y, s, dr_pen());
+        dr_move(x + 1, y);
+        dr_flush();
+        return 0;
+    }
+    if (key == UI_KEY_LEFT) { x--; moved = 1; }
+    else if (key == UI_KEY_RIGHT) { x++; moved = 1; }
+    else if (key == UI_KEY_UP) { y--; moved = 1; }
+    else if (key == UI_KEY_DOWN) { y++; moved = 1; }
+    else if (key == UI_KEY_HOME) { x = 0; moved = 1; }
+    else if (key == UI_KEY_END) { x = UI_CANVAS_COLS - 1; moved = 1; }
+    else if (key == UI_KEY_PGUP) { y -= 8; moved = 1; }
+    else if (key == UI_KEY_PGDN) { y += 8; moved = 1; }
+    else if (key == ' ') dr_act();
+    else if (key == 'c') M.dr_fg = (M.dr_fg + 1) & 15;
+    else if (key == 'b') M.dr_bg = (M.dr_bg + 1) & 15;
+    else if (key == 'h') lc_pick_open(&M);
+    else if (key == 'u') ui_paint_undo_step(&dr_paint, &had);
+    else if (key == 'r') ui_paint_redo_step(&dr_paint, &had);
+    else if (key == 'p') {
+        M.dr_down = !M.dr_down;
+        if (M.dr_down) { ui_paint_begin(&dr_paint); ui_paint_dot(&dr_paint, x, y, dr_pen()); }
+        else ui_paint_end(&dr_paint);
+    }
+    else if (key == 't') ui_popup_open(&M.dr_pop, dr_tools, DT_COUNT, 0, 1, 2, M.rows, M.cols);
+    else if (key == 'x') dr_clear();
+    else if (key == UI_KEY_ESC) {
+        if (dr_tool == DT_TEXT) dr_set_tool(DT_DRAW);
+        else if (M.dr_anchor) { M.dr_anchor = 0; }
+        else if (M.dr_down) { M.dr_down = 0; ui_paint_end(&dr_paint); }
+        else dr_leave();
+        if (!M.draw) return 0;
+    }
+    if (moved) {
+        dr_move(x, y);
+        if (M.dr_down && dr_tool == DT_DRAW) { ui_paint_dot(&dr_paint, M.dr_x, M.dr_y, dr_pen()); return 0; }   /* a freehand stroke posts when it idles */
+    }
+    if (M.draw) dr_flush();
+    return 0;
+}
+
+static void draw_mouse(const ae_mouse_event *e, int row, int col)
+{
+    int idx;
+    if (M.dr_pick.open) {
+        if (e->kind == 'P') lc_pick_click(&M, row, col);
+        return;
+    }
+    if (M.dr_pop.open) {
+        if (e->kind == 'P') { int pick = ui_popup_click(&M.dr_pop, row, col); if (pick >= 0) dr_pick_tool(pick); }
+        return;
+    }
+    if (e->kind == 'R') { if (!M.dr_down) ui_paint_end(&dr_paint); dr_flush(); return; }
+    if (lc_hit(row, col, &idx) != LC_HIT_CANVAS) return;
+    if (e->kind == 'P' && e->button == AE_MOUSE_LEFT) {
+        dr_move(col + M.dr_left, row + M.dr_top);
+        if (dr_tool == DT_DRAW && !M.dr_down) ui_paint_begin(&dr_paint);
+        dr_act();
+        if (dr_tool != DT_DRAW) dr_flush();
+    } else if (e->kind == 'M' && e->button == AE_MOUSE_LEFT && dr_tool == DT_DRAW) {
+        dr_move(col + M.dr_left, row + M.dr_top);
+        ui_paint_dot(&dr_paint, M.dr_x, M.dr_y, dr_pen());
+    }
+}
+
+/** /draw [art channel]: opens the canvas of the current art channel, or joins the named one. */
+static int join_room(const char *id);
+static void draw_typed(const char *arg)
+{
+    if (*arg == '\0') {
+        if (room_id[0] != '\0' && strcmp(room_kind_of(room_id), "art") == 0) dr_enter();
+        else system_line("Usage: /draw <art channel>  (art channels are marked [A] in the sidebar)");
+        return;
+    }
+    if (strcmp(room_kind_of(arg), "art") != 0) { system_line("That is not an Art channel."); return; }
+    join_room(arg);
+}
+
+#define LC_JOIN_REFUSED (-100)   /* a Voice room: the door has no voice yet */
+
+/** TS opens the voice grid; telnet has no voice yet (spot 2026-11-09). An Art channel opens the /draw canvas. */
+static int refuse_kind(void)
+{
+    system_line("Voice channels are not on Amiga yet.");
     return LC_JOIN_REFUSED;
 }
 
@@ -1177,7 +1532,7 @@ static int join_room(const char *id)
     char name[48], topic[80], motd[512], line[128], old[48];
     int members = 0, rc;
     const char *kind = room_kind_of(id);
-    if (strcmp(kind, "text") != 0) return refuse_kind(kind);
+    if (strcmp(kind, "voice") == 0) return refuse_kind();
     copy(old, sizeof old, room_id);
     rc = ae_chat_join(&chat, id, name, sizeof name, topic, sizeof topic, motd, sizeof motd, &members);
     if (rc != AE_CHAT_OK) { show_error(rc); return rc; }
@@ -1196,9 +1551,11 @@ static int join_room(const char *id)
     system_line(line);
     sprintf(line, "Joined #%.40s", room_name);
     add_note(LC_ACTIVITY_LINE, line);
-    if (ae_chat_history(&chat, room_id, 0, 30) == AE_CHAT_OK) take_history();
+    if (ae_chat_history(&chat, room_id, 0, HISTORY_LIMIT) == AE_CHAT_OK) take_history();
     idset_drop(&unread_rooms, room_id);            /* the room is read once it is open */
     load_sidebar();
+    M.draw = 0;
+    if (strcmp(kind, "art") == 0) dr_enter();
     return AE_CHAT_OK;
 }
 
@@ -1207,6 +1564,7 @@ static void leave_room(void)
     char line[80];
     if (room_id[0] == '\0') { system_line("You are not in a channel."); return; }
     ae_chat_leave(&chat, room_id);
+    M.draw = 0;
     sprintf(line, "Left #%.40s", room_name);
     room_id[0] = '\0';
     M.room[0] = '\0';
@@ -1245,8 +1603,8 @@ static void new_room(const char *name, const char *topic, const char *visibility
     if (rc != AE_CHAT_OK) { show_error(rc); return; }
     if (motd[0] != '\0' && (rc = ae_chat_room_motd(&chat, id, motd)) != AE_CHAT_OK) show_error(rc);
     load_rooms();
-    /* The kind is known here; a stale room list must not let a Voice or Art room be joined. */
-    rc = strcmp(kind, "text") != 0 ? refuse_kind(kind) : join_room(id);
+    /* The kind is known here; a stale room list must not let a Voice room be joined. */
+    rc = strcmp(kind, "voice") == 0 ? refuse_kind() : join_room(id);
     if (rc == AE_CHAT_OK) sprintf(line, "Created #%.40s", room_name);
     else if (rc == LC_JOIN_REFUSED) sprintf(line, "Created #%.40s", name);
     else return;
@@ -2205,6 +2563,269 @@ static void view_add(const char *text)
     if (M.view_n < LC_VIEW_MAX) copy(M.view_text[M.view_n++], LC_VIEW_COL, text);
 }
 
+/* The preview body, up to AE_CHAT_PREVIEW_MAX (128 KB). Allocated on the first picture, not static:
+ * as BSS it pushed the hunk past the board emulator's 0x7f000 door ceiling (DoorTooLargeError, the
+ * door never started). */
+static unsigned char *preview_buf;
+
+/** ae_chat_file_preview into preview_buf, allocating it first. AE_CHAT_ERR_TOO_LONG when no memory. */
+static int preview_fetch(const char *fid, int cols, int rows, int rgb, int *oc, int *orows)
+{
+    if (!preview_buf) preview_buf = (unsigned char *)malloc(AE_CHAT_PREVIEW_MAX);
+    if (!preview_buf) return AE_CHAT_ERR_TOO_LONG;
+    return ae_chat_file_preview(&chat, fid, cols, rows, rgb, preview_buf, AE_CHAT_PREVIEW_MAX, oc, orows);
+}
+
+/** TS previewErrorLine. */
+static void preview_error(int rc)
+{
+    char line[64];
+    if (rc == AE_CHAT_ERR_FILES_DISABLED) system_line("File sharing is off on this hub");
+    else if (rc == AE_CHAT_ERR_NOT_MEMBER) system_line("You are not a member of that room");
+    else if (rc == AE_CHAT_ERR_NOT_IMAGE) system_line("That file is not a picture");
+    else { sprintf(line, "Preview failed (%d)", rc); system_line(line); }
+}
+
+static void view_kitty_open(int idx);
+
+/** /view N: the ASCII thumbnail (TS asciiCells ramp) of a shared picture in the text overlay. */
+static void view_typed(const char *arg)
+{
+    static const char ramp[] = " .:-=+*#%@";
+    char line[LC_VIEW_COL], msg[48];
+    int n = atoi(arg), oc = 0, orows = 0, rc, r, c;
+    if (n < 1 || n > shared_n) {
+        if (shared_n) { sprintf(msg, "No file %d (1-%d)", n, shared_n); system_line(msg); }
+        else system_line("No files shared yet this session");
+        return;
+    }
+    if (strcmp(shared_files[n - 1].kind, "image") != 0) { preview_error(AE_CHAT_ERR_NOT_IMAGE); return; }
+    if (ae_can(AE_CAP_KITTY)) { view_kitty_open(n - 1); return; }
+    rc = preview_fetch(shared_files[n - 1].id, 60, 20, 1, &oc, &orows);
+    if (rc < 0) { preview_error(rc); return; }
+    if (oc > LC_VIEW_COL - 1) oc = LC_VIEW_COL - 1;
+    if (orows > LC_VIEW_MAX) orows = LC_VIEW_MAX;
+    view_open(shared_files[n - 1].name);
+    for (r = 0; r < orows; r++) {
+        for (c = 0; c < oc; c++) {
+            const unsigned char *px = preview_buf + ((long)r * oc + c) * 3;
+            int lum = (299 * px[0] + 587 * px[1] + 114 * px[2]) * 9 / 255000;
+            line[c] = ramp[lum > 9 ? 9 : lum];
+        }
+        line[oc] = '\0';
+        view_add(line);
+    }
+}
+
+/* ---- inline pictures: kitty graphics (TS features/chat-pictures.ts), only when ae_can(AE_CAP_KITTY) ----
+ * A picture of N cell rows is N LC_PICTURE log lines, so it scrolls row by row with the text. The PNG is
+ * stored in the terminal once (a=t); after every frame the visible slice is placed again with a vertical
+ * crop (a=p, y/h, C=1) when the placement changed, and removed when it scrolled out or an overlay covers
+ * the log. Image ids 1..LC_PIC_MAX are inline pictures, LC_PIC_ID_VIEW the /view overlay (31 is the query). */
+#define LC_PIC_MAX 24
+#define LC_PIC_ID_VIEW 30
+#define LC_PIC_ROWS_MAX 60
+#define LC_PIC_PLACEMENT 1                     /* p= of every placement: a re-place moves it, no delete first */
+#define LC_PIC_HISTORY_MAX 8                   /* the newest pictures of a join that are fetched and drawn inline */
+typedef struct { int serial, kid, cols, rows, pw, ph; char at[40]; } lc_pic;
+static lc_pic pics[LC_PIC_MAX];
+static int pic_serial, view_kitty;
+
+/** Raw escape bytes to the caller. ae_put takes a NUL terminated string, kitty output has no NUL, so the bytes
+ *  go through in short pieces. Callers flush the cell screen first (ui_screen_flush) so the order holds. */
+static void raw_put(void *u, const char *s, long n)
+{
+    char buf[160];
+    int k = 0;
+    long i;
+    (void)u;
+    for (i = 0; i < n; i++) {
+        if (s[i] == '\0') continue;
+        buf[k++] = s[i];
+        if (k == (int)sizeof buf - 1) { buf[k] = '\0'; ae_put(buf, 0); k = 0; }
+    }
+    if (k > 0) { buf[k] = '\0'; ae_put(buf, 0); }
+}
+
+/** kout_png always sends a=T (store and draw at the cursor); the first chunk becomes a=t (store only). */
+static void store_put(void *u, const char *s, long n)
+{
+    if (n >= 6 && memcmp(s, "\033_Ga=T", 6) == 0) { raw_put(u, "\033_Ga=t", 6); raw_put(u, s + 6, n - 6); }
+    else raw_put(u, s, n);
+}
+
+/** Place the visible slice of a stored picture at screen row/col (0-based), cursor saved and restored.
+ *  skip rows are cut off the top; shown rows remain. The crop is in image pixels, rounded per row boundary. */
+static void pic_place(const lc_pic *p, int row, int col, int skip, int shown)
+{
+    char b[24];
+    kout_crop crop;
+    long y, h;
+    memset(&crop, 0, sizeof crop);
+    if ((skip > 0 || shown < p->rows) && p->pw > 0 && p->ph > 0) {   /* the TS sliceCrop */
+        y = ((long)skip * p->ph * 2 + p->rows) / (2 * p->rows);
+        h = ((long)(skip + shown) * p->ph * 2 + p->rows) / (2 * p->rows) - y;
+        if (h < 1) h = 1;
+        crop.y = y; crop.w = p->pw; crop.h = h;
+    }
+    sprintf(b, "\0337\033[%d;%dH", row + 1, col + 1);
+    raw_put(0, b, (long)strlen(b));
+    kout_place(raw_put, 0, p->kid, p->cols, shown, LC_PIC_PLACEMENT, &crop);
+    raw_put(0, "\0338", 2);
+}
+
+static int overlay_covers_log(void)
+{
+    return M.help || M.view || M.menu >= 0 || M.settings || M.theme || M.draw || M.search || M.fmt || M.ctx.open
+        || M.modal != LC_MODAL_NONE
+        || (!M.slash_off && M.focus == LC_FOCUS_INPUT && M.input[0] == '/');
+}
+
+/** After a frame: place each picture's visible rows, or remove its placement when none are visible. */
+static void pics_update(void)
+{
+    int i, r;
+    int hide = !ae_can(AE_CAP_KITTY) || lc_chat_rows == 0 || overlay_covers_log();
+    for (i = 0; i < LC_PIC_MAX; i++) {
+        lc_pic *p = &pics[i];
+        int first = -1, skip = 0, shown = 0;
+        char at[40];
+        if (p->serial == 0) continue;
+        for (r = 0; !hide && r < lc_chat_rows; r++) {
+            int li = lc_chat_row_line(r);
+            if (li >= 0 && M.lines[li].kind == LC_PICTURE && M.lines[li].pic == p->serial) {
+                if (first < 0) { first = r; skip = M.lines[li].pic_row; }
+                shown++;
+            }
+        }
+        if (shown == 0) {
+            if (p->at[0] != '\0') { kout_delete(raw_put, 0, p->kid, 1); p->at[0] = '\0'; }
+            continue;
+        }
+        sprintf(at, "%d:%d:%d:%d:%d", first, lc_chat_body, lc_chat_left, skip, shown);
+        if (strcmp(at, p->at) != 0) {
+            pic_place(p, lc_chat_body + first, lc_chat_left, skip, shown);
+            copy(p->at, sizeof p->at, at);
+        }
+    }
+}
+
+/** Fetch a picture's PNG (log width unless it is smaller: the hub never upscales), store it in the terminal and
+ *  insert its blank rows at log position pos. Returns the rows inserted, 0 without kitty or on a failed fetch. */
+static int pic_insert(int pos, const char *fid)
+{
+    int width = lc_chat_width > 6 ? lc_chat_width - 2 : (cells.cols > 40 ? cells.cols - 34 : 36);
+    int oc = 0, orows = 0, rc, i, slot;
+    lc_pic *p;
+    kout_opts o;
+    if (!ae_can(AE_CAP_KITTY)) return 0;
+    rc = preview_fetch(fid, width, 64, 0, &oc, &orows);
+    if (rc <= 0 || oc < 1 || orows < 1) return 0;
+    if (orows > LC_PIC_ROWS_MAX) orows = LC_PIC_ROWS_MAX;
+    slot = pic_serial % LC_PIC_MAX;
+    p = &pics[slot];
+    ui_screen_flush(&screen);
+    if (p->serial != 0) kout_delete(raw_put, 0, p->kid, 0);           /* the ring reuses the oldest id */
+    memset(p, 0, sizeof *p);
+    p->serial = ++pic_serial;
+    p->kid = slot + 1;
+    p->cols = oc;
+    p->rows = orows;
+    if (rc >= 24 && memcmp(preview_buf + 1, "PNG", 3) == 0) {           /* IHDR: big-endian width, height */
+        p->pw = (preview_buf[16] << 24) | (preview_buf[17] << 16) | (preview_buf[18] << 8) | preview_buf[19];
+        p->ph = (preview_buf[20] << 24) | (preview_buf[21] << 16) | (preview_buf[22] << 8) | preview_buf[23];
+    }
+    memset(&o, 0, sizeof o);
+    o.id = p->kid;
+    o.quiet = 2;
+    kout_png(store_put, 0, preview_buf, rc, &o);
+    for (i = 0; i < orows; i++) {
+        lc_line *l = line_slot(pos + i);
+        l->kind = LC_PICTURE;
+        l->pic = p->serial;
+        l->pic_row = i;
+    }
+    M.scroll = 0;
+    return orows;
+}
+
+/** /view N with kitty: the full-size picture over the overlay box; Esc deletes the image. */
+static void view_kitty_open(int idx)
+{
+    int h = cells.rows - 2, w = cells.cols - 4, oc = 0, orows = 0, rc;
+    kout_opts o;
+    lc_pic v;
+    if (w > 76) w = 76;
+    rc = preview_fetch(shared_files[idx].id, w - 2, h - 2, 0, &oc, &orows);
+    if (rc <= 0) { preview_error(rc < 0 ? rc : AE_CHAT_ERR_BODY); return; }
+    view_open(shared_files[idx].name);
+    ui_screen_flush(&screen);
+    memset(&o, 0, sizeof o);
+    o.id = LC_PIC_ID_VIEW;
+    o.quiet = 2;
+    kout_png(store_put, 0, preview_buf, rc, &o);
+    memset(&v, 0, sizeof v);
+    v.kid = LC_PIC_ID_VIEW; v.cols = oc; v.rows = orows;
+    pic_place(&v, (cells.rows - h) / 2 + 1, (cells.cols - w) / 2 + 1, 0, orows);
+    view_kitty = 1;
+}
+
+static void view_kitty_close(void)
+{
+    if (!view_kitty) return;
+    view_kitty = 0;
+    ui_screen_flush(&screen);
+    kout_delete(raw_put, 0, LC_PIC_ID_VIEW, 0);
+}
+
+/** LC1: the hub's files list merged into the history just read (lines after `marker`), in time order, with the
+ *  announcement line the live file_shared handler prints, and the inline picture under it. TS withSharedPictures:
+ *  every picture when the history page is short, else only those no older than its oldest message; a message
+ *  comes before a picture of the same second. Returns the announcement lines added. */
+static int pictures_into_history(int marker, int nhist, int limit)
+{
+    static struct { char id[32], name[64], who[24], kind[12]; long at; } rows[LC_SHARED_MAX];
+    char *f[AE_CHAT_ROW_FIELDS];
+    char line[220];
+    long oldest = 0;
+    int n = 0, i, k, added = 0, fetched = 0;
+    if (room_id[0] == '\0' || ae_chat_files(&chat, room_id) != AE_CHAT_OK) return 0;
+    while (n < LC_SHARED_MAX && (k = ae_chat_next_row(&chat, f, AE_CHAT_ROW_FIELDS)) >= 7) {
+        if (strcmp(f[6], "image") != 0) continue;
+        copy(rows[n].id, sizeof rows[n].id, f[0]);
+        copy(rows[n].name, sizeof rows[n].name, f[1]);
+        copy(rows[n].who, sizeof rows[n].who, f[3]);
+        rows[n].at = epoch_of(f[4]);
+        n++;
+    }
+    for (i = marker + 1; i < M.nlines; i++)
+        if (M.lines[i].kind == LC_HISTORY && M.lines[i].epoch > 0 && (oldest == 0 || M.lines[i].epoch < oldest)) oldest = M.lines[i].epoch;
+    for (i = n - 1; i >= 0; i--) {                    /* the hub lists newest first: oldest picture gets the lowest number */
+        int num = 0, pos, j;
+        if (nhist >= limit && rows[i].at < oldest) continue;
+        for (j = 0; j < shared_n; j++) if (strcmp(shared_files[j].id, rows[i].id) == 0) num = j + 1;
+        if (num == 0) {
+            sprintf(line, "%s|0|image", rows[i].name);
+            num = shared_add(rows[i].id, line);
+            if (num < 0) continue;
+        }
+        pos = M.nlines;
+        for (j = marker + 1; j < M.nlines; j++)
+            if ((M.lines[j].kind == LC_HISTORY || M.lines[j].kind == LC_LIVE) && M.lines[j].epoch > rows[i].at) { pos = j; break; }
+        {
+            lc_line *l = line_slot(pos);
+            sprintf(line, "%.30s shared a picture: %.60s (/view)  #%d [PICTURE] %.60s", rows[i].who, rows[i].name, num, rows[i].name);
+            l->kind = LC_SYSTEM;
+            l->seq = chat.last_seq;
+            l->epoch = rows[i].at;
+            clean(l->text, sizeof l->text, line);
+        }
+        added++;
+        if (i < LC_PIC_HISTORY_MAX && fetched < LC_PIC_HISTORY_MAX) { fetched++; pic_insert(pos + 1, rows[i].id); }
+    }
+    return added;
+}
+
 /** An epoch the server sent (seconds or milliseconds) as JS toLocaleString("en-US") prints it: "11/9/2026, 3:04:05 PM". */
 static void datetime_of(char *out, const char *epoch)
 {
@@ -2634,10 +3255,11 @@ static int run_command(const char *line)
     if (strcmp(cmd, "emojis") == 0) { emojis_typed(rest); return 0; }
     if (strcmp(cmd, "customemoji") == 0) { customemoji_typed(rest); return 0; }
     /* TS commands/voice.ts, mic.ts, ui.ts open web-only views: voice, mic and video are not on
-     * Amiga yet (spot 2026-11-09); draw and files wait for their ports. */
+     * Amiga yet (spot 2026-11-09); files waits for its port. */
     if (is_cmd(cmd, "voice", "vc") || is_cmd(cmd, "deafen", "deaf") || is_cmd(cmd, "undeafen", "undeaf")
         || strcmp(cmd, "mic") == 0) { system_line("Voice is not on Amiga yet."); return 0; }
-    if (is_cmd(cmd, "draw", "whiteboard") || strcmp(cmd, "art") == 0) { system_line("Drawing is not on Amiga yet."); return 0; }
+    if (is_cmd(cmd, "draw", "whiteboard") || strcmp(cmd, "art") == 0) { draw_typed(rest); return 0; }
+    if (is_cmd(cmd, "view", "picture")) { view_typed(rest); return 0; }
     if (is_cmd(cmd, "files", "file") || strcmp(cmd, "share") == 0) { system_line("File sharing is not on Amiga yet."); return 0; }
     system_line("Unknown command. Type /help for help.");
     return 0;
@@ -2815,6 +3437,8 @@ static void fmt_click(int hit, int idx, int button)
     if (button == AE_MOUSE_LEFT) M.fmt = 0;
 }
 
+static void relayout(void);
+
 static void door_idle(void *ctx)
 {
     int polled, opened;
@@ -2823,7 +3447,9 @@ static void door_idle(void *ctx)
     if (polled) do_poll();
     opened = fmt_tick(IDLE_SLEEP_TICKS);
     if (typing_tick(IDLE_SLEEP_TICKS)) opened = 1;
+    if (M.draw && dr_any) { dr_flush(); opened = 1; }   /* a freehand stroke goes out when the caller pauses */
     if (polled || opened) present();
+    if (ui_screen_wide_step(&screen, 0, 0)) relayout();   /* the terminal grew or shrank on its own (a browser resize) */
 }
 
 /* ---- keys --------------------------------------------------------------- */
@@ -3050,6 +3676,7 @@ static int handle_mouse(void)
         ae_mouse_event *e = &evs[i];
         int row = e->row - 1, col = e->col - 1, idx, hit;
         mouse_events++;
+        if (M.draw && M.modal == LC_MODAL_NONE) { draw_mouse(e, row, col); continue; }
         if (e->kind == 'U' || e->kind == 'D') {
             int up = e->kind == 'U';
             if (lc_hit(row, col, &idx) == LC_HIT_SIDEBAR) side_move(up ? -2 : 2);
@@ -3218,7 +3845,7 @@ static int slash_key(int key)
         pick = ghost;
     } else {
         pick = ghost >= 0 ? ghost : idx[M.slash_sel];   /* TS enterOnCommandSuggestions: the ghost outranks the selected row */
-        if (lc_slash_exact(M.input, pick)) return 0;    /* "/name" typed in full: the normal submit runs it */
+        if (lc_slash_complete(M.input)) return 0;       /* a name or alias typed in full: the normal submit runs it */
     }
     sprintf(fill, "/%s ", lc_cmd_help[pick][0]);
     copy(M.input, sizeof M.input, fill);
@@ -3243,6 +3870,7 @@ static void kind_cancelled(void)
 static int handle_key(int key)
 {
     if (key == UI_KEY_MOUSE) return handle_mouse();
+    if (M.draw && M.modal == LC_MODAL_NONE) return draw_key(key);
     if (M.ctx.open) {
         int pick = ui_popup_key(&M.ctx, key);
         if (pick >= 0) ctx_run(M.ctx.items[pick]);
@@ -3262,7 +3890,7 @@ static int handle_key(int key)
         else if (key == UI_KEY_UP && M.view_top > 0) M.view_top--;
         else if (key == UI_KEY_PGDN) { M.view_top += 10; if (M.view_top > M.view_n - 1) M.view_top = M.view_n - 1; }
         else if (key == UI_KEY_PGUP) { M.view_top -= 10; if (M.view_top < 0) M.view_top = 0; }
-        else if (key == UI_KEY_ESC || key == 'q') M.view = 0;
+        else if (key == UI_KEY_ESC || key == 'q') { M.view = 0; view_kitty_close(); }
         return 0;
     }
     if (M.search) { search_key(key); return 0; }
@@ -3450,6 +4078,18 @@ static int setup_wizard(ae_chat_config *cfg)
     }
 }
 
+/** The terminal changed size (Alt+Enter, or the caller resized): reopen the cell canvas at the new size, keep the
+    transcript and the input, repaint everything. The only door-specific half of ui_screen_wide_step. */
+static void relayout(void)
+{
+    ui_cells_close(&cells);
+    if (ui_cells_open(&cells, screen.cols, screen.rows) != 0) return;
+    lc_model_resize(&M, screen.cols, screen.rows);
+    ansi_clear(&screen.buf);
+    ui_cells_invalidate(&cells);
+    present();
+}
+
 static void finish(void)
 {
     ui_cells_close(&cells);
@@ -3480,6 +4120,7 @@ int main(int argc, char **argv)
         return 20;
     }
     ui_screen_open_responsive(&screen, &session, frame_buffer, (long)sizeof(frame_buffer));
+    ui_screen_wide_restore(&screen);                          /* the call's saved Alt+Enter choice; the step below follows the resize */
     ae_user_name(&session, handle, (int)sizeof(handle));
     if (handle[0] == '\0') strcpy(handle, "Anon");
     lc_set_self(handle);                                      /* its @mentions are highlighted in incoming lines */
@@ -3562,6 +4203,11 @@ int main(int argc, char **argv)
     while (!ended) {
         int key = ui_key_read(&keys, &pushback);
         if (key < 0) break;
+        {
+            int was = key;
+            if (ui_screen_wide_step(&screen, &key, &pushback)) relayout();   /* Alt+Enter is ESC CR: toggled and swallowed (key 0) */
+            if (was != 0 && key == 0) continue;
+        }
         /* idle_ticks is NOT reset here: it counts the idle hook's sleeps, the door's only clock. The
            board's any-motion mouse mode sends a wake byte on every hover move, and a reset per key
            kept the event poll from ever running while the mouse moved (sysop test 2026-11-08). */

@@ -46,6 +46,12 @@ typedef struct { char kind; int col; int row; int button; } ae_mouse_event;
 
 /** 1 answered, 0 silent board (outputs untouched), AE_BS_GONE. */
 int ae_bs_size(int *cols, int *rows);
+/** The 80x25 / responsive switch (AEW_SCREEN "WIDE ON|OFF"): remembers the call's choice and asks the terminal to
+    grow or shrink. SIZE then answers the new size, a moment later for a web caller (ui_screen_wide_step watches).
+    1 done, 0 silent board, AE_BS_GONE. */
+int ae_bs_wide(int on);
+/** The call's saved choice (AEW_SCREEN "WIDE?"): 1 wide, 0 fixed 80x25 (also a silent board), AE_BS_GONE. */
+int ae_bs_wide_state(void);
 /** 1 capturing (draw now, then ae_bs_wipe_end), 0 no wipe (draw normally), AE_BS_GONE.
     `conceal` 0 plays the screen in, 1 plays it out; `letter` is the board's wipe code, 0 = none. */
 int ae_bs_wipe_begin(char letter, int conceal);

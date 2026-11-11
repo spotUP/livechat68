@@ -235,8 +235,9 @@ static int collect(void *ctx, const unsigned char *buf, unsigned long len)
 
 static int open_session(ae_chat *c);
 
-static int call_once(ae_chat *c, const char *method, const char *path,
-                     const char *body, unsigned long body_len)
+static int call_once_x(ae_chat *c, const char *method, const char *path,
+                       const char *body, unsigned long body_len,
+                       ae_http_sink_fn sink, void *sink_ctx, ae_http_header_fn on_header)
 {
     char auth[256];
     char sidh[96];
@@ -276,7 +277,7 @@ static int call_once(ae_chat *c, const char *method, const char *path,
 
     c->calls++;
     rc = ae_http_request(&target, method, path, body, body_len, headers, nheaders,
-                         &response, collect, c, 0);
+                         &response, sink, sink_ctx, on_header);
     if (rc != AE_HTTP_OK) {
         c->http_error = rc;
         return AE_CHAT_ERR_TRANSPORT;
@@ -292,23 +293,36 @@ static int call_once(ae_chat *c, const char *method, const char *path,
     return AE_CHAT_OK;
 }
 
+static int call_once(ae_chat *c, const char *method, const char *path,
+                     const char *body, unsigned long body_len)
+{
+    return call_once_x(c, method, path, body, body_len, collect, c, 0);
+}
+
 /* One call, and when the server says the session expired, one silent reopen
  * and one retry. The poll every few seconds keeps a live session alive; this
  * covers a caller who sat in a prompt past the 90 s limit. */
-static int call(ae_chat *c, const char *method, const char *path,
-                const char *body, unsigned long body_len)
+static int call_x(ae_chat *c, const char *method, const char *path,
+                  const char *body, unsigned long body_len,
+                  ae_http_sink_fn sink, void *sink_ctx, ae_http_header_fn on_header)
 {
-    int rc = call_once(c, method, path, body, body_len);
+    int rc = call_once_x(c, method, path, body, body_len, sink, sink_ctx, on_header);
 
     if (rc == AE_CHAT_ERR_STATUS && strcmp(c->error, "session_expired") == 0 &&
         !blank(c->handle)) {
         if (open_session(c) == AE_CHAT_OK) {
-            rc = call_once(c, method, path, body, body_len);
+            rc = call_once_x(c, method, path, body, body_len, sink, sink_ctx, on_header);
         } else {
             rc = AE_CHAT_ERR_STATUS;
         }
     }
     return rc;
+}
+
+static int call(ae_chat *c, const char *method, const char *path,
+                const char *body, unsigned long body_len)
+{
+    return call_x(c, method, path, body, body_len, collect, c, 0);
 }
 
 /* ----------------------------------------------------------------- session */
@@ -369,11 +383,13 @@ static int starts_with(const char *s, const char *prefix)
 }
 
 /* Consume the "NAME|version|revision|count" header every text route opens with (the door server's
- * renderText: ROOMS, EVENTS, HISTORY, DM, WHO, MEMBERS, REACTIONS). Left in, a header reads as a data
- * row wherever a caller asks for fewer than four fields (a DM list showed a thread "1"). */
+ * renderText: ROOMS, EVENTS, HISTORY, DM, WHO, MEMBERS, REACTIONS, ...). Left in, a header reads as a data
+ * row wherever a caller asks for fewer than four fields (a DM list showed a thread "1"), and a caller that
+ * stops at the first short row reads nothing at all (the FILES list never reached the door, so LiveChat 68K
+ * placed no pictures). Every renderText name a door reads must be listed here. */
 static int has_header(const char *reply)
 {
-    static const char *const names[] = { "ROOMS|", "EVENTS|", "HISTORY|", "DM|", "WHO|", "MEMBERS|", "REACTIONS|", "PROFILE|", "IGNORES|", "EMOJI|" };
+    static const char *const names[] = { "ROOMS|", "EVENTS|", "HISTORY|", "DM|", "WHO|", "MEMBERS|", "REACTIONS|", "PROFILE|", "IGNORES|", "EMOJI|", "FILES|" };
     unsigned i;
     for (i = 0; i < sizeof names / sizeof names[0]; i++) if (starts_with(reply, names[i])) return 1;
     return 0;
@@ -393,6 +409,14 @@ static void skip_header(ae_chat *c, long *seq)
     c->cursor = nl != 0 ? (unsigned long)(nl - c->reply) + 1 : c->reply_len;
 }
 
+/* An events row of type canvas: "seq|canvas|...". */
+static int is_canvas_row(const char *line)
+{
+    const char *p = line;
+    while (*p >= '0' && *p <= '9') p++;
+    return p != line && starts_with(p, "|canvas|");
+}
+
 int ae_chat_next_row(ae_chat *c, char **fields, int max)
 {
     char *line;
@@ -405,7 +429,13 @@ int ae_chat_next_row(ae_chat *c, char **fields, int max)
         p = strchr(line, '\n');
         if (p != 0) { *p = '\0'; c->cursor = (unsigned long)(p - c->reply) + 1; }
         else c->cursor = c->reply_len;
-        rtrim(line);
+        if (is_canvas_row(line)) {
+            /* a canvas event's ops end in cells, and a trailing space is one: strip only the CR */
+            unsigned long n = (unsigned long)strlen(line);
+            while (n > 0 && line[n - 1] == '\r') line[--n] = '\0';
+        } else {
+            rtrim(line);
+        }
         if (line[0] == '\0') continue;
 
         for (i = 0; i < max; i++) fields[i] = line + strlen(line); /* "" */
@@ -644,6 +674,14 @@ int ae_chat_reactions(ae_chat *c, const char *msg_id)
     return get_text(c, path);
 }
 
+int ae_chat_files(ae_chat *c, const char *room)
+{
+    char path[PATH_MAX_LEN];
+    int rc = make_path(path, sizeof path, AE_CHAT_BASE "/rooms/", room, "/files.txt");
+    if (rc != AE_CHAT_OK) return rc;
+    return get_text(c, path);
+}
+
 /* `"key":"value"` appended at `at`, a comma first unless it is the first field. -1 when it does not fit. */
 int ae_chat_dm_group(ae_chat *c, const char *const *peers, int n, const char *text,
                      char *thread_id, int cap)
@@ -747,6 +785,42 @@ int ae_chat_typing(ae_chat *c, const char *room, const char *text)
     if (at >= 0) at = ae_req_put_raw(body, sizeof body, (unsigned long)at, "}");
     if (at < 0) return AE_CHAT_ERR_TOO_LONG;
     return call(c, "POST", path, body, (unsigned long)at);
+}
+
+int ae_chat_canvas_get(ae_chat *c, const char *room, int from, int count)
+{
+    char path[PATH_MAX_LEN];
+    char suffix[64];
+
+    sprintf(suffix, "/canvas.txt?from=%d&count=%d&maxBytes=7680", from, count);
+    if (make_path(path, sizeof path, AE_CHAT_BASE "/rooms/", room, suffix) != AE_CHAT_OK) return AE_CHAT_ERR_ARGS;
+    return call(c, "GET", path, 0, 0);   /* the reply stays whole: the CANVAS header is the caller's to parse */
+}
+
+int ae_chat_canvas_post(ae_chat *c, const char *room, long base, const char *ops, int len, long *rev)
+{
+    char path[PATH_MAX_LEN];
+    char body[BODY_MAX + 2 * 512];
+    char text[520];
+    char lead[48];
+    long at;
+    int rc = make_path(path, sizeof path, AE_CHAT_BASE "/rooms/", room, "/canvas");
+
+    if (rc != AE_CHAT_OK) return rc;
+    if (len < 1 || len >= (int)sizeof text) return AE_CHAT_ERR_ARGS;
+    memcpy(text, ops, (size_t)len);   /* the ops are a (pointer, length): the escaper wants a C string */
+    text[len] = '\0';
+    sprintf(lead, "{\"base\":%ld,\"ops\":", base);
+    at = ae_req_put_raw(body, sizeof body, 0, lead);
+    if (at >= 0) at = ae_req_put_json_string(body, sizeof body, (unsigned long)at, text);
+    if (at >= 0) at = ae_req_put_raw(body, sizeof body, (unsigned long)at, "}");
+    if (at < 0) return AE_CHAT_ERR_TOO_LONG;
+    rc = call(c, "POST", path, body, (unsigned long)at);
+    if (rc == AE_CHAT_OK && rev != 0) {
+        const char *p = strstr(c->reply, "\"rev\":");
+        *rev = p != 0 ? atol(p + 6) : 0;
+    }
+    return rc;
 }
 
 int ae_chat_mode(ae_chat *c, const char *room, const char *modes, const char *params,
@@ -1158,4 +1232,107 @@ int ae_chat_ignore(ae_chat *c, const char *user, int add)
     if (at >= 0) at = ae_req_put_raw(body, sizeof body, (unsigned long)at, "}");
     if (at < 0) return AE_CHAT_ERR_TOO_LONG;
     return call(c, "POST", AE_CHAT_BASE "/ignores", body, (unsigned long)at);
+}
+
+/* ------------------------------------------------------- picture previews */
+
+/* The binary body goes to the caller's buffer; the same bytes also pass
+ * through collect() so an error reply (a small JSON body) reaches c->error
+ * exactly as for every other call. A reopened session starts a new attempt:
+ * c->calls changes, so the buffer is rewound. */
+typedef struct {
+    ae_chat *c;
+    unsigned char *buf;
+    unsigned long cap;
+    unsigned long len;
+    int overflow;
+    int attempt;
+    int cols, rows;
+} preview_ctx;
+
+static void preview_rewind(preview_ctx *p)
+{
+    if (p->attempt != p->c->calls) {
+        p->attempt = p->c->calls;
+        p->len = 0;
+        p->overflow = 0;
+        p->cols = p->rows = 0;
+    }
+}
+
+static int preview_sink(void *ctx, const unsigned char *buf, unsigned long len)
+{
+    preview_ctx *p = (preview_ctx *)ctx;
+
+    preview_rewind(p);
+    if (len > p->cap - p->len) {
+        p->overflow = 1;
+    } else {
+        memcpy(p->buf + p->len, buf, len);
+        p->len += len;
+    }
+    return collect(p->c, buf, len);
+}
+
+static int preview_header(void *ctx, const char *name, const char *value)
+{
+    preview_ctx *p = (preview_ctx *)ctx;
+    int w = 0, h = 0;
+    const char *s = value;
+    unsigned long i;
+    static const char want[] = "x-cells";
+
+    preview_rewind(p);
+    if (strlen(name) != sizeof want - 1) return 0;
+    for (i = 0; i < sizeof want - 1; i++) {
+        char ch = name[i];
+        if (ch >= 'A' && ch <= 'Z') ch = (char)(ch + 32);
+        if (ch != want[i]) return 0;
+    }
+    while (*s >= '0' && *s <= '9') w = w * 10 + (*s++ - '0');
+    if (*s != 'x') return 0;
+    s++;
+    while (*s >= '0' && *s <= '9') h = h * 10 + (*s++ - '0');
+    p->cols = w;
+    p->rows = h;
+    return 0;
+}
+
+int ae_chat_file_preview(ae_chat *c, const char *file_id, int cols, int rows, int rgb,
+                         unsigned char *buf, unsigned long cap, int *out_cols, int *out_rows)
+{
+    char path[PATH_MAX_LEN];
+    char query[32];
+    char suffix[48];
+    preview_ctx p;
+    int rc;
+
+    if (c == 0 || buf == 0 || cap == 0) return AE_CHAT_ERR_ARGS;
+    if (cap > AE_CHAT_PREVIEW_MAX) cap = AE_CHAT_PREVIEW_MAX;
+    query[0] = '\0';
+    /* A PNG is asked for as q=pal: the hub's 255-colour indexed picture at exactly cols*8 x rows*16, which
+     * DCTelnet draws 1:1 in its own colours (no area-averaging, no 6x6x6 cube dither). */
+    if (cols > 0 && rows > 0) sprintf(query, rgb ? "?cols=%d&rows=%d" : "?cols=%d&rows=%d&q=pal", cols, rows);
+    else if (!rgb) strcpy(query, "?q=pal");
+    sprintf(suffix, "/%s%s", rgb ? "preview.rgb" : "preview.png", query);
+    rc = make_path(path, sizeof path, AE_CHAT_BASE "/files/", file_id, suffix);
+    if (rc != AE_CHAT_OK) return rc;
+
+    memset(&p, 0, sizeof p);
+    p.c = c;
+    p.buf = buf;
+    p.cap = cap;
+    rc = call_x(c, "GET", path, 0, 0, preview_sink, &p, preview_header);
+    if (rc == AE_CHAT_ERR_STATUS) {
+        if (c->status == 403 && strcmp(c->error, "not_member") == 0) return AE_CHAT_ERR_NOT_MEMBER;
+        if (c->status == 415 && strcmp(c->error, "not_image") == 0) return AE_CHAT_ERR_NOT_IMAGE;
+        if (c->status == 503 && strcmp(c->error, "files_disabled") == 0) return AE_CHAT_ERR_FILES_DISABLED;
+        return rc;
+    }
+    if (rc != AE_CHAT_OK) return rc;
+    if (p.overflow) return AE_CHAT_ERR_PREVIEW_TOO_BIG;
+    if (p.len == 0) return AE_CHAT_ERR_BODY;
+    if (out_cols != 0) *out_cols = p.cols;
+    if (out_rows != 0) *out_rows = p.rows;
+    return (int)p.len;
 }
