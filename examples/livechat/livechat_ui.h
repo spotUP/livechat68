@@ -117,6 +117,13 @@ typedef struct {
 extern int lc_chat_body, lc_chat_left, lc_chat_rows, lc_chat_width;
 int lc_chat_row_line(int r);
 
+/* Screen rectangles the last frame drew OVER the chat log (dropdown, popup, slash list, picker, modal), 0-based.
+   The door cuts a picture around them (sysop rule 2026-11-12, "picture behind menus"; TS PictureLog.covers). */
+#define LC_COVER_MAX 8
+typedef struct { int row, col, rows, cols; } lc_rect;
+extern lc_rect lc_covers[LC_COVER_MAX];
+extern int lc_cover_n;
+
 enum { LC_SIDE_HEAD, LC_SIDE_ROOM, LC_SIDE_USER, LC_SIDE_DM, LC_SIDE_BLANK };
 
 #define LC_SIDE_MAX 48
@@ -387,5 +394,6 @@ int lc_pick_click(lc_model *m, int row, int col);
 /** The chat scroll offset (lc_model.scroll) that puts the scrollbar thumb's middle on 0-based screen
  *  `row` in the last drawn frame, clamped to the track; -1 when the frame drew no scrollbar. */
 int lc_scroll_at(int row);
+int lc_scroll_max(void);
 
 #endif

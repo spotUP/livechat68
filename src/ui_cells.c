@@ -28,6 +28,7 @@ int ui_cells_open(ui_cells *c, int cols, int rows)
     for (i = 0; i < n; i++) { set_cell(&c->back[i], ' ', 7, -1, 0); c->front[i] = c->back[i]; }
     c->full = 1;
     c->fg = 7; c->bg = UI_CELLS_DEFAULT; c->bold = 0;
+    ui_cells_forget(c);
     return 0;
 }
 
@@ -39,7 +40,9 @@ void ui_cells_close(ui_cells *c)
     c->cols = c->rows = 0;
 }
 
-void ui_cells_invalidate(ui_cells *c) { c->full = 1; }
+void ui_cells_forget(ui_cells *c) { c->t_row = c->t_col = -1; c->t_have = 0; c->t_show = -1; }
+
+void ui_cells_invalidate(ui_cells *c) { c->full = 1; ui_cells_forget(c); }
 
 void ui_cells_wide_table(ui_cells *c, const char *const *glyphs, int n)
 {
@@ -310,11 +313,45 @@ static void out_sgr(ansi_buf *b, const ui_cell *p)
 }
 
 #define STYLE_FLAGS (UI_CELLS_BOLD | UI_CELLS_BG_DEFAULT | UI_CELLS_UNDERLINE | UI_CELLS_ITALIC | UI_CELLS_REVERSE)
+#define ATTR_FLAGS (UI_CELLS_BOLD | UI_CELLS_UNDERLINE | UI_CELLS_ITALIC | UI_CELLS_REVERSE)
+static int same_bg(const ui_cell *a, const ui_cell *b)
+{
+    if ((a->flags ^ b->flags) & UI_CELLS_BG_DEFAULT) return 0;
+    return (a->flags & UI_CELLS_BG_DEFAULT) || a->bg == b->bg;
+}
 static int same_style(const ui_cell *a, const ui_cell *b)
 {
     /* UI_CELLS_WIDE / _TAIL say what the cell holds, not how it is drawn. */
-    return a->fg == b->fg && a->bg == b->bg
-        && (a->flags & STYLE_FLAGS) == (b->flags & STYLE_FLAGS);
+    return a->fg == b->fg && (a->flags & ATTR_FLAGS) == (b->flags & ATTR_FLAGS) && same_bg(a, b);
+}
+/* A blank shows its background and nothing else (no underline, no reverse): it can go out in whatever
+ * foreground, bold and italic the terminal holds. A cleared row beside coloured text then costs no SGR. */
+static int blank_fits(const ui_cell *pen, const ui_cell *p)
+{
+    return p->ch == ' '
+        && !((pen->flags | p->flags) & (UI_CELLS_UNDERLINE | UI_CELLS_REVERSE | UI_CELLS_WIDE | UI_CELLS_WIDE_TAIL))
+        && same_bg(pen, p);
+}
+/* From the style the terminal holds (`pen`, when `have`) to p's. Only what differs is sent
+ * (ESC[32m, not ESC[0;49;32m) as long as nothing has to be switched OFF; an attribute that must go
+ * takes the reset-led form, which every terminal understands (22/23/24/27 are not universal). */
+static void out_sgr_to(ansi_buf *b, int have, const ui_cell *pen, const ui_cell *p)
+{
+    int add, sep = 0;
+    if (!have || (pen->flags & ATTR_FLAGS & ~p->flags)) { out_sgr(b, p); return; }
+    add = p->flags & ~pen->flags & ATTR_FLAGS;
+    out_str(b, "\033[");
+    if (add & UI_CELLS_BOLD) { out_byte(b, '1'); sep = 1; }
+    if (add & UI_CELLS_ITALIC) { if (sep) out_byte(b, ';'); out_byte(b, '3'); sep = 1; }
+    if (add & UI_CELLS_UNDERLINE) { if (sep) out_byte(b, ';'); out_byte(b, '4'); sep = 1; }
+    if (add & UI_CELLS_REVERSE) { if (sep) out_byte(b, ';'); out_byte(b, '7'); sep = 1; }
+    if (!same_bg(pen, p)) {
+        if (sep) out_byte(b, ';');
+        if (p->flags & UI_CELLS_BG_DEFAULT) out_str(b, "49"); else out_colour(b, 40, 100, 48, p->bg);
+        sep = 1;
+    }
+    if (pen->fg != p->fg) { if (sep) out_byte(b, ';'); out_colour(b, 30, 90, 38, p->fg); }
+    out_byte(b, 'm');
 }
 
 /* A cell is four bytes; the flush compares it as one 32-bit word. memcpy keeps that legal for any
@@ -343,15 +380,16 @@ static long ui_cells_first_diff(const ui_cell *a, const ui_cell *b, long n)
 }
 #endif
 
-void ui_cells_flush(ui_cells *c, ansi_buf *out, ui_cells_drain_fn drain, void *ctx)
+/* The flush proper. It starts from the cursor position and style the terminal was left with
+ * (c->t_*; unknown after ui_cells_forget) and records where it leaves them. */
+static void flush_cells(ui_cells *c, ansi_buf *out, ui_cells_drain_fn drain, void *ctx)
 {
     long i = 0, n = (long)c->cols * c->rows, last = n - 1;
-    int cur_row = -1, cur_col = -1, have_style = 0, cols = c->cols, full = c->full;
+    int cur_row = c->t_row, cur_col = c->t_col, have_style = c->t_have, cols = c->cols, full = c->full, styled = 0;
     int next_row = 0, next_col = 0;     /* row and column of cell i, stepped rather than divided */
     long done = -1;                     /* the last cell this flush sent */
     const char *wide;
-    ui_cell style;
-    memset(&style, 0, sizeof style);
+    ui_cell style = c->t_style;
     c->sent = 0;
     while (i < last) {
         ui_cell *p;
@@ -382,9 +420,28 @@ void ui_cells_flush(ui_cells *c, ansi_buf *out, ui_cells_drain_fn drain, void *c
         }
         if (drain != 0 && out->len > out->cap - 64) { drain(ctx); }
         if (row != cur_row || col != cur_col) {
-            out_str(out, "\033["); out_int(out, row + 1); out_byte(out, ';'); out_int(out, col + 1); out_byte(out, 'H');
+            int gap = row == cur_row ? col - cur_col : 0, k = 0;
+            if (gap > 0 && gap <= 4 && have_style) {
+                /* A few unchanged cells in the style the terminal holds: resending them (a byte each)
+                 * is shorter than any cursor move over them. */
+                const ui_cell *q = p - gap;
+                while (k < gap && !(q[k].flags & (UI_CELLS_WIDE | UI_CELLS_WIDE_TAIL))
+                       && (same_style(&style, &q[k]) || blank_fits(&style, &q[k]))) k++;
+                if (k == gap) for (k = 0; k < gap; k++) out_byte(out, (char)q[k].ch);
+                else k = 0;
+            }
+            if (k > 0) { /* bridged */ }
+            else if (gap > 0) { out_str(out, "\033["); if (gap > 1) out_int(out, gap); out_byte(out, 'C'); }
+            else {
+                out_str(out, "\033["); out_int(out, row + 1);
+                if (col > 0) { out_byte(out, ';'); out_int(out, col + 1); }   /* ESC[rH: column 1 */
+                out_byte(out, 'H');
+            }
         }
-        if (!have_style || !same_style(&style, p)) { out_sgr(out, p); style = *p; have_style = 1; }
+        if (!have_style || !(same_style(&style, p) || blank_fits(&style, p))) {
+            out_sgr_to(out, have_style, &style, p);
+            style = *p; style.flags &= STYLE_FLAGS; have_style = 1; styled = 1;
+        }
         if (wide != 0) {
             out_str(out, wide);
             c->front[i] = *p;
@@ -407,11 +464,30 @@ void ui_cells_flush(ui_cells *c, ansi_buf *out, ui_cells_drain_fn drain, void *c
         if (cur_col >= c->cols) cur_row = -1;
     }
     c->front[n - 1] = c->back[n - 1];
-    if (have_style) {
+    c->t_row = cur_row; c->t_col = cur_col; c->t_style = style; c->t_have = have_style;
+    if (styled) {
         /* ansi_color's cache no longer matches the terminal. */
         out->last_fg = -1; out->last_bg = -1; out->last_bold = -1; out->last_reverse = -1;
     }
     c->full = 0;
+}
+
+void ui_cells_flush(ui_cells *c, ansi_buf *out, ui_cells_drain_fn drain, void *ctx)
+{
+    ui_cells_forget(c);                 /* the caller may have written to the terminal itself */
+    flush_cells(c, out, drain, ctx);
+    ui_cells_forget(c);
+}
+
+void ui_cells_present(ui_cells *c, ansi_buf *out, ui_cells_drain_fn drain, void *ctx, int caret, int cr, int cc)
+{
+    caret = caret ? 1 : 0;
+    flush_cells(c, out, drain, ctx);
+    if (c->t_show != caret) { out_str(out, caret ? "\033[?25h" : "\033[?25l"); c->t_show = caret; }
+    if (caret && (c->t_row != cr || c->t_col != cc)) {
+        out_str(out, "\033["); out_int(out, cr + 1); out_byte(out, ';'); out_int(out, cc + 1); out_byte(out, 'H');
+        c->t_row = cc < c->cols ? cr : -1; c->t_col = cc;
+    }
 }
 
 /* One row of `w` cells in one colour: `text` from the left, spaces after it. The menu bar, the

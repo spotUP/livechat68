@@ -547,9 +547,10 @@ static void present(void)
     int caret = M.draw && M.modal == LC_MODAL_NONE ? 1 : M.focus == LC_FOCUS_INPUT && !M.help && !M.view && M.menu < 0 && !M.settings && !M.theme
                 && (M.modal == LC_MODAL_NONE || M.modal == LC_MODAL_PROMPT);
     lc_draw(&cells, &M, &cr, &cc);
-    ui_cells_flush(&cells, &screen.buf, drain, 0);
-    ui_screen_cursor(&screen, caret);
-    if (caret) ansi_goto(&screen.buf, cr + 1, cc + 1);
+    /* The flush and the text cursor in one call that remembers where it left the terminal: a key typed
+     * at the caret is one byte on the wire, not a cursor move, a colour and a cursor-show around it. */
+    ui_cells_present(&cells, &screen.buf, drain, 0, caret, cr, cc);
+    screen.cursor_visible = caret ? 1 : 0;
     ui_screen_flush(&screen);
     pics_update();
 }
@@ -2620,14 +2621,16 @@ static void view_typed(const char *arg)
 /* ---- inline pictures: kitty graphics (TS features/chat-pictures.ts), only when ae_can(AE_CAP_KITTY) ----
  * A picture of N cell rows is N LC_PICTURE log lines, so it scrolls row by row with the text. The PNG is
  * stored in the terminal once (a=t); after every frame the visible slice is placed again with a vertical
- * crop (a=p, y/h, C=1) when the placement changed, and removed when it scrolled out or an overlay covers
- * the log. Image ids 1..LC_PIC_MAX are inline pictures, LC_PIC_ID_VIEW the /view overlay (31 is the query). */
+ * crop (a=p, y/h, C=1) when the placement changed, and removed when it scrolled out. An open menu, popup or
+ * modal (lc_covers) cuts it into cropped pieces around the overlay, one placement each (TS pictureTiles). Image ids 1..LC_PIC_MAX are inline pictures, LC_PIC_ID_VIEW the /view overlay (31 is the query). */
 #define LC_PIC_MAX 24
 #define LC_PIC_ID_VIEW 30
 #define LC_PIC_ROWS_MAX 60
 #define LC_PIC_PLACEMENT 1                     /* p= of every placement: a re-place moves it, no delete first */
+#define LC_PIC_Z 0                             /* z= over the text: pieces cut around menus keep them clear; under-background z hides it on SGR 40 cells */
 #define LC_PIC_HISTORY_MAX 8                   /* the newest pictures of a join that are fetched and drawn inline */
-typedef struct { int serial, kid, cols, rows, pw, ph; char at[40]; } lc_pic;
+#define LC_PIC_PIECES_MAX 8                    /* more pieces than this: the picture hides until the cover closes */
+typedef struct { int serial, kid, cols, rows, pw, ph, pieces; char at[160]; } lc_pic;
 static lc_pic pics[LC_PIC_MAX];
 static int pic_serial, view_kitty;
 
@@ -2645,6 +2648,7 @@ static void raw_put(void *u, const char *s, long n)
         if (k == (int)sizeof buf - 1) { buf[k] = '\0'; ae_put(buf, 0); k = 0; }
     }
     if (k > 0) { buf[k] = '\0'; ae_put(buf, 0); }
+    ui_cells_forget(&cells);                            /* the cursor is no longer where the last frame left it */
 }
 
 /** kout_png always sends a=T (store and draw at the cursor); the first chunk becomes a=t (store only). */
@@ -2670,26 +2674,82 @@ static void pic_place(const lc_pic *p, int row, int col, int skip, int shown)
     }
     sprintf(b, "\0337\033[%d;%dH", row + 1, col + 1);
     raw_put(0, b, (long)strlen(b));
-    kout_place(raw_put, 0, p->kid, p->cols, shown, LC_PIC_PLACEMENT, &crop);
+    kout_place_z(raw_put, 0, p->kid, p->cols, shown, LC_PIC_PLACEMENT, LC_PIC_Z, &crop);
     raw_put(0, "\0338", 2);
 }
 
-static int overlay_covers_log(void)
+/** The parts of a that b does not cover, up to four, into out. Returns the count (TS subtractRect). */
+static int rect_sub(const lc_rect *a, const lc_rect *b, lc_rect *out)
 {
-    return M.help || M.view || M.menu >= 0 || M.settings || M.theme || M.draw || M.search || M.fmt || M.ctx.open
-        || M.modal != LC_MODAL_NONE
-        || (!M.slash_off && M.focus == LC_FOCUS_INPUT && M.input[0] == '/');
+    int top = a->row > b->row ? a->row : b->row;
+    int bottom = a->row + a->rows < b->row + b->rows ? a->row + a->rows : b->row + b->rows;
+    int left = a->col > b->col ? a->col : b->col;
+    int right = a->col + a->cols < b->col + b->cols ? a->col + a->cols : b->col + b->cols;
+    int n = 0;
+    if (bottom <= top || right <= left) { out[0] = *a; return 1; }
+    if (top > a->row) { out[n].row = a->row; out[n].col = a->col; out[n].rows = top - a->row; out[n].cols = a->cols; n++; }
+    if (bottom < a->row + a->rows) { out[n].row = bottom; out[n].col = a->col; out[n].rows = a->row + a->rows - bottom; out[n].cols = a->cols; n++; }
+    if (left > a->col) { out[n].row = top; out[n].col = a->col; out[n].rows = bottom - top; out[n].cols = left - a->col; n++; }
+    if (right < a->col + a->cols) { out[n].row = top; out[n].col = right; out[n].rows = bottom - top; out[n].cols = a->col + a->cols - right; n++; }
+    return n;
 }
 
-/** After a frame: place each picture's visible rows, or remove its placement when none are visible. */
+/** The screen pieces of a picture cols wide at row/col with shown rows that no overlay hides (TS pictureTiles):
+ *  one when nothing covers it, 0 when a cover hides it all or it needs more than LC_PIC_PIECES_MAX. */
+static int pic_pieces(int row, int col, int shown, int cols, lc_rect *tiles)
+{
+    lc_rect next[LC_PIC_PIECES_MAX * 4];
+    int n = 1, c, t, k;
+    tiles[0].row = row; tiles[0].col = col; tiles[0].rows = shown; tiles[0].cols = cols;
+    for (c = 0; c < lc_cover_n; c++) {
+        int m = 0;
+        for (t = 0; t < n; t++) m += rect_sub(&tiles[t], &lc_covers[c], next + m);
+        if (m > LC_PIC_PIECES_MAX) return 0;
+        for (k = 0; k < m; k++) tiles[k] = next[k];
+        n = m;
+    }
+    return n;
+}
+
+/** The rounded pixel edge of cell boundary n of a picture px pixels over cells (TS pieceCrop ex/ey). */
+static long pic_edge(long px, int cells_n, int n)
+{
+    long e = (2L * px * n + cells_n) / (2L * cells_n);
+    return e < px ? e : px;
+}
+
+/** Place one piece: cells pcols x prows at screen row/col, cut from picture cell col/row (0-based in the whole
+ *  picture). Edges sit on the same rounded boundary as the neighbour's, so pieces meet without a seam. */
+static void pic_place_piece(const lc_pic *p, int srow, int scol, int col, int row, int pcols, int prows, int i)
+{
+    char b[24];
+    kout_crop crop;
+    long x, y, w, h;
+    x = pic_edge(p->pw, p->cols, col); if (x > p->pw - 1) x = p->pw - 1;
+    y = pic_edge(p->ph, p->rows, row); if (y > p->ph - 1) y = p->ph - 1;
+    w = pic_edge(p->pw, p->cols, col + pcols) - x; if (w < 1) w = 1;
+    h = pic_edge(p->ph, p->rows, row + prows) - y; if (h < 1) h = 1;
+    memset(&crop, 0, sizeof crop);
+    crop.x = x; crop.y = y; crop.w = w; crop.h = h;
+    sprintf(b, "\0337\033[%d;%dH", srow + 1, scol + 1);
+    raw_put(0, b, (long)strlen(b));
+    kout_place_z(raw_put, 0, p->kid, pcols, prows, LC_PIC_PLACEMENT + i, LC_PIC_Z, &crop);
+    raw_put(0, "\0338", 2);
+}
+
+/** After a frame: place each picture's visible rows, or remove its placement when none are visible.
+ *  A menu, overlay or modal never lifts a picture (sysop decision 2026-11-12, TS door the same); it sits in
+ *  front of it: the picture is cut into pieces around every open overlay ("picture behind menus"). */
 static void pics_update(void)
 {
-    int i, r;
-    int hide = !ae_can(AE_CAP_KITTY) || lc_chat_rows == 0 || overlay_covers_log();
+    int i, r, t;
+    int hide = !ae_can(AE_CAP_KITTY) || lc_chat_rows == 0;
     for (i = 0; i < LC_PIC_MAX; i++) {
         lc_pic *p = &pics[i];
-        int first = -1, skip = 0, shown = 0;
-        char at[40];
+        int first = -1, skip = 0, shown = 0, n, cut;
+        lc_rect tiles[LC_PIC_PIECES_MAX];
+        char at[160];
+        int k;
         if (p->serial == 0) continue;
         for (r = 0; !hide && r < lc_chat_rows; r++) {
             int li = lc_chat_row_line(r);
@@ -2700,13 +2760,28 @@ static void pics_update(void)
         }
         if (shown == 0) {
             if (p->at[0] != '\0') { kout_delete(raw_put, 0, p->kid, 1); p->at[0] = '\0'; }
+            p->pieces = 0;
             continue;
         }
-        sprintf(at, "%d:%d:%d:%d:%d", first, lc_chat_body, lc_chat_left, skip, shown);
-        if (strcmp(at, p->at) != 0) {
-            pic_place(p, lc_chat_body + first, lc_chat_left, skip, shown);
-            copy(p->at, sizeof p->at, at);
+        n = pic_pieces(lc_chat_body + first, lc_chat_left, shown, p->cols, tiles);
+        cut = n != 1 || tiles[0].cols != p->cols || tiles[0].rows != shown;
+        if (cut && (p->pw <= 0 || p->ph <= 0)) n = 0;        /* without a pixel size no piece can be cut */
+        sprintf(at, "%d:%d:%d:%d:%d|", first, lc_chat_body, lc_chat_left, skip, shown);
+        for (t = 0; t < n; t++) {
+            k = (int)strlen(at);
+            sprintf(at + k, "%d,%d,%d,%d;", tiles[t].row, tiles[t].col, tiles[t].rows, tiles[t].cols);
         }
+        if (strcmp(at, p->at) == 0) continue;
+        /* A picture still in view moves by placing it again with the same p= (no blank between); a picture hidden
+           wholly under a cover is deleted, pieces no longer needed go one placement at a time. */
+        if (p->pieces > 0 && n == 0) kout_delete(raw_put, 0, p->kid, 1);
+        else for (t = n; t < p->pieces; t++) kout_delete_p(raw_put, 0, p->kid, 1, LC_PIC_PLACEMENT + t);
+        copy(p->at, sizeof p->at, at);
+        p->pieces = n;
+        if (!cut) pic_place(p, lc_chat_body + first, lc_chat_left, skip, shown);
+        else for (t = 0; t < n; t++)
+            pic_place_piece(p, tiles[t].row, tiles[t].col, tiles[t].col - lc_chat_left, skip + tiles[t].row - (lc_chat_body + first),
+                            tiles[t].cols, tiles[t].rows, t);
     }
 }
 
@@ -3448,7 +3523,12 @@ static void door_idle(void *ctx)
     opened = fmt_tick(IDLE_SLEEP_TICKS);
     if (typing_tick(IDLE_SLEEP_TICKS)) opened = 1;
     if (M.draw && dr_any) { dr_flush(); opened = 1; }   /* a freehand stroke goes out when the caller pauses */
-    if (polled || opened) present();
+    if (polled || opened) {
+        /* Once per poll the frame starts from nothing known (13 bytes: cursor show and position), so a
+         * cursor the board moved behind the door's back (a node message) is put right within a poll. */
+        ui_cells_forget(&cells);
+        present();
+    }
     if (ui_screen_wide_step(&screen, 0, 0)) relayout();   /* the terminal grew or shrank on its own (a browser resize) */
 }
 
@@ -3486,6 +3566,7 @@ static void copy_text(const char *marked)
     }
     plain[n] = '\0';
     ansi_clipboard(&screen.buf, plain);
+    ui_cells_forget(&cells);
 }
 
 /** An item whose wire this board does not have yet: say so instead of doing nothing. */
@@ -3680,7 +3761,7 @@ static int handle_mouse(void)
         if (e->kind == 'U' || e->kind == 'D') {
             int up = e->kind == 'U';
             if (lc_hit(row, col, &idx) == LC_HIT_SIDEBAR) side_move(up ? -2 : 2);
-            else { M.scroll += up ? 3 : -3; if (M.scroll < 0) M.scroll = 0; if (M.scroll > LC_LINES * 4) M.scroll = LC_LINES * 4; }
+            else { M.scroll += up ? 3 : -3; if (M.scroll < 0) M.scroll = 0; if (M.scroll > lc_scroll_max()) M.scroll = lc_scroll_max(); }
             continue;
         }
         if (bar_drag) {                         /* the thumb follows the pointer until the button comes up */
@@ -3940,7 +4021,7 @@ static int handle_key(int key)
     }
     if (key == 9) { cycle_focus(1); return 0; }
     if (key == UI_KEY_BACKTAB) { cycle_focus(-1); return 0; }
-    if (key == UI_KEY_PGUP) { M.scroll += 10; if (M.scroll > LC_LINES * 4) M.scroll = LC_LINES * 4; return 0; }
+    if (key == UI_KEY_PGUP) { M.scroll += 10; if (M.scroll > lc_scroll_max()) M.scroll = lc_scroll_max(); return 0; }
     if (key == UI_KEY_PGDN) { M.scroll -= 10; if (M.scroll < 0) M.scroll = 0; return 0; }
 
     if (M.pick[0] != '\0') {                  /* the keyboard picker owns Up/Down/Enter/Esc (TS server.ts) */

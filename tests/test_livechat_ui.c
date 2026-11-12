@@ -646,9 +646,35 @@ static int long_input_scrolls(void)
     return bad;
 }
 
+/* DCTelnet 2026-11-11: dragging the scrollbar thumb made it jump one row back. lc_scroll_at must pick
+ * a scroll that draw_chat turns back into the dragged thumb row, and the top of the bar is the whole
+ * span (lc_scroll_max), the cap the wheel and PgUp keys use. */
+static int scrollbar_drag_lands_on_the_row(void)
+{
+    static lc_model m;
+    ui_cells c;
+    int cr, cc, i, rows, span, total, thumb, track, pos, bad = 0;
+    char text[32];
+    main_state(&m, 80, 25);
+    for (i = 0; i < 60; i++) { sprintf(text, "drag line %d", i); add_line(&m, LC_LIVE, "12:00", "alice", text); }
+    if (ui_cells_open(&c, 80, 25) != 0) return 1;
+    lc_draw(&c, &m, &cr, &cc);
+    rows = lc_chat_rows; span = lc_scroll_max(); total = rows + span;
+    if (span <= 0) { printf("FAIL drag: no scrollbar\n"); ui_cells_close(&c); return 1; }
+    thumb = rows * rows / total; if (thumb < 1) thumb = 1;
+    track = rows - thumb;
+    for (pos = 0; pos <= track; pos++) {
+        int sc = lc_scroll_at(lc_chat_body + pos + thumb / 2), first = span - sc;
+        if (first * track / span != pos) { printf("FAIL drag: row %d draws the thumb at %d\n", pos, first * track / span); bad = 1; }
+    }
+    if (lc_scroll_at(lc_chat_body) != span) { printf("FAIL drag: top of the bar is %d, not the span %d\n", lc_scroll_at(lc_chat_body), span); bad = 1; }
+    ui_cells_close(&c);
+    return bad;
+}
+
 int main(void)
 {
-    int r = chat_cache_and_pane_fill() | react_rows_under_the_message() | stamps_follow_the_pref() | active_panel_is_highlighted() | picker_selects_and_draws() | slash_menu_rules() | message_formatting() | event_line_marks() | system_line_tone() | format_picker_model() | theme_menu_columns() | colours_match_ts() | draw_canvas_view() | draw_pick_view() | long_input_scrolls();
+    int r = chat_cache_and_pane_fill() | react_rows_under_the_message() | stamps_follow_the_pref() | active_panel_is_highlighted() | picker_selects_and_draws() | slash_menu_rules() | message_formatting() | event_line_marks() | system_line_tone() | format_picker_model() | theme_menu_columns() | colours_match_ts() | draw_canvas_view() | draw_pick_view() | long_input_scrolls() | scrollbar_drag_lands_on_the_row();
     int a = compare("tests/fixtures/lc68-ts-main-80x25.grid");
     int b = compare("tests/fixtures/lc68-ts-main-40x25.grid");
     int d = compare("tests/fixtures/lc68-ts-main-80x15.grid");

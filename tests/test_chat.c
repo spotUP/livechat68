@@ -1207,6 +1207,30 @@ static void test_door_pictures_kitty(void)
     /* scroll the log: the crop changes row by row, and the image is deleted once fully out. /q closed
      * the door's cell grid, so the scroll phase reopens one at the door's last screen size. */
     assert(ui_cells_open(&cells, screen.cols, screen.rows) == 0);
+    /* sysop rule 2026-11-12 "picture behind menus": an open menu cuts the picture into cropped pieces around it
+     * (p=1, p=2 ...), never a whole-image delete; closing it places the whole slice on p=1 again and deletes
+     * the extra pieces one placement at a time (TS anOpenMenuKeepsThePicture). */
+    for (i = 0; i < 9; i++) {                                                      /* lift the picture under the menu bar */
+        lc_line *l = line_slot(M.nlines);
+        l->kind = LC_SYSTEM; strcpy(l->text, "filler");
+    }
+    M.scroll = 0;
+    capture_present(frame, sizeof frame);
+    M.menu = 3;                                                                     /* drops over the picture's top right */
+    capture_present(frame, sizeof frame);
+    assert(strstr(frame, "d=I") == 0 && strstr(frame, "a=d") == 0);                 /* cut, never lifted */
+    assert(strstr(frame, "a=p,i=1,c=12,r=2,p=1,") != 0 && strstr(frame, ",y=24,w=64,h=24,") != 0);  /* rows under the menu */
+    assert(strstr(frame, "a=p,i=1,c=7,r=2,p=2,") != 0 && strstr(frame, ",w=37,h=24,") != 0);       /* columns left of it */
+    assert(strstr(frame, "p=3") == 0);
+    M.menu = -1;
+    capture_present(frame, sizeof frame);
+    assert(strstr(frame, "a=d,d=i,i=1,p=2,q=2") != 0);                              /* the extra piece goes alone */
+    assert(strstr(frame, "a=p,i=1,c=12,r=4,p=1,") != 0 && strstr(frame, "d=I") == 0); /* whole slice back on p=1 */
+    M.help = 1;                                                                     /* covers the whole picture */
+    capture_present(frame, sizeof frame);
+    assert(strstr(frame, "a=d,d=i,i=1,q=2") != 0 && strstr(frame, "a=p") == 0);      /* hidden, data kept */
+    M.help = 0;
+    capture_present(frame, sizeof frame);
     for (i = 0; i < 40; i++) {
         lc_line *l = line_slot(M.nlines);
         l->kind = LC_SYSTEM; strcpy(l->text, "filler");
@@ -1219,6 +1243,8 @@ static void test_door_pictures_kitty(void)
         if (strstr(frame, "a=p") != 0 && strstr(frame, "C=1") == 0) assert(!"placement without C=1");
         /* a move re-places with the same placement id, so the terminal swaps it in one step: no delete first */
         if (strstr(frame, "a=p") != 0 && strstr(frame, ",p=1,") == 0) assert(!"placement without p=1");
+        /* the picture draws behind menus: z below -1073741824 puts it under cells with a background colour */
+        if (strstr(frame, "a=p") != 0 && strstr(frame, ",z=-") != 0) assert(!"placement under cell backgrounds: invisible on an Amiga caller");
         if (strstr(frame, "a=p") != 0 && strstr(frame, "d=i") != 0) assert(!"delete before a move");
         if (y >= 0) saw_crop = 1;
         if (y != last_y) changes++;
@@ -1608,9 +1634,9 @@ static void test_door_message_formatting(void)
     start_stub();
     rc = drive(KEYS("\r" "say *slant* {red-fg}hot{/} @Tester\r"), 0);
     assert(rc == 0 && has_line("Tester", "*slant*"));              /* the event row carries the raw text */
-    assert(strstr(screen_text, "\033[0;3;49;38;5;255mslant") != 0);            /* *x*: italic in the text colour */
+    assert(strstr(screen_text, "\033[3mslant") != 0);                         /* *x*: italic added to the text colour already set */
     assert(strstr(screen_text, "\033[0;49;31mhot") != 0);                          /* {red-fg}: ANSI red, the tag eaten */
-    assert(strstr(screen_text, "\033[0;7;49;33m@Tester") != 0);   /* own name: reversed yellow */
+    assert(strstr(screen_text, "\033[7;33m@Tester") != 0);        /* own name: reversed yellow */
     stop_stub();
 }
 

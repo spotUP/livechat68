@@ -776,6 +776,25 @@ static void typing_marked(const lc_model *m, int i, char *out, int cap)
 #define CHAT_ROWS_MAX 128
 static ui_hit lc_hits;                              /* the last frame's click regions, topmost last */
 int lc_chat_body, lc_chat_left, lc_chat_rows, lc_chat_width;
+lc_rect lc_covers[LC_COVER_MAX];
+int lc_cover_n;
+
+/** Record an overlay drawn over the log this frame; past LC_COVER_MAX the whole screen counts as covered. */
+static void cover(int row, int col, int rows, int cols)
+{
+    if (lc_cover_n == LC_COVER_MAX) { lc_covers[LC_COVER_MAX - 1].row = 0; lc_covers[LC_COVER_MAX - 1].col = 0;
+        lc_covers[LC_COVER_MAX - 1].rows = 1000; lc_covers[LC_COVER_MAX - 1].cols = 1000; return; }
+    lc_covers[lc_cover_n].row = row; lc_covers[lc_cover_n].col = col;
+    lc_covers[lc_cover_n].rows = rows; lc_covers[lc_cover_n].cols = cols;
+    lc_cover_n++;
+}
+
+/** ui_cells_modal that records its box as a cover (same clamp as ui_cells_modal). */
+static void lc_modal(ui_cells *c, int h, int w, int border_fg, const char *label, int label_fg, int *top, int *left)
+{
+    ui_cells_modal(c, h, w, border_fg, label, label_fg, top, left);
+    cover(*top, *left, h > c->rows ? c->rows : h, w > c->cols ? c->cols : w);
+}
 static int chat_row_line[CHAT_ROWS_MAX];            /* chat body row -> line index, -1 empty */
 
 /* The scrollbar of the last drawn chat pane, for lc_scroll_at (R1a drag). bar_rows 0 = no scrollbar. */
@@ -1112,6 +1131,7 @@ static void draw_slash(ui_cells *c, const lc_model *m)
     ui_cells_pen(c, LC_INK, UI_CELLS_DEFAULT, 0);
     ui_cells_fill(c, brow - rows - 1, 1, rows, W - 2, ' ');
     ui_cells_box(c, brow - rows - 2, 0, rows + 2, W, LC_ACCENT, " Commands ", LC_INK);
+    cover(brow - rows - 2, 0, rows + 2, W);
     for (i = 0; i < rows; i++) {
         int r = brow - rows - 1 + i, ucol, ulen, sel = top + i == m->slash_sel;
         lc_slash_row(row, sizeof row, idx[top + i], W, &ucol, &ulen);
@@ -1359,6 +1379,7 @@ static void draw_fmt(ui_cells *c, const lc_model *m)
     ui_cells_pen(c, LC_INK, UI_CELLS_DEFAULT, 0);
     ui_cells_fill(c, top + 1, left + 1, H - 2, w - 2, ' ');
     ui_cells_box(c, top, left, H, w, LC_ACCENT, emoji ? " Emoji Picker [Tab | Enter] " : " Format ", LC_INK);
+    cover(top, left, H, w);
     ui_cells_box(c, top + 1, left + 1, H - 4, catw, ok, " Category ", LC_INK);   /* height 100%-2 */
     for (i = 0; i < ncat; i++) {                                 /* categoryStyle: selected ground on ok */
         int sel = i == m->fmt_cat;
@@ -1403,7 +1424,7 @@ static void draw_help(ui_cells *c, const lc_model *m)
     int top, left, h = c->rows - 2, w = c->cols - 4, i;
     if (w > 76) w = 76;
     ui_cells_pen(c, LC_INK, UI_CELLS_DEFAULT, 0);
-    ui_cells_modal(c, h, w, LC_ACCENT, "Help", LC_INK, &top, &left);
+    lc_modal(c, h, w, LC_ACCENT, "Help", LC_INK, &top, &left);
     for (i = 0; i < h - 2 && m->help_top + i < lc_help_lines; i++) {
         const char *t = lc_help_text[m->help_top + i];
         int head = t[0] == '=' || t[0] == '-';
@@ -1419,7 +1440,7 @@ static void draw_view(ui_cells *c, const lc_model *m)
     int top, left, h = c->rows - 2, w = c->cols - 4, i;
     if (w > 76) w = 76;
     ui_cells_pen(c, LC_INK, UI_CELLS_DEFAULT, 0);
-    ui_cells_modal(c, h, w, LC_ACCENT, m->view_title, LC_INK, &top, &left);
+    lc_modal(c, h, w, LC_ACCENT, m->view_title, LC_INK, &top, &left);
     for (i = 0; i < h - 2 && m->view_top + i < m->view_n; i++) {
         const char *t = m->view_text[m->view_top + i];
         int head = t[0] == '=';
@@ -1434,7 +1455,7 @@ static void draw_modal(ui_cells *c, const lc_model *m, int *cr, int *cc)
     int top, left, w = 50;
     ui_cells_pen(c, LC_INK, UI_CELLS_DEFAULT, 0);
     if (m->modal == LC_MODAL_PROMPT) {
-        ui_cells_modal(c, 7, w, LC_ACCENT, "Message", LC_INK, &top, &left);
+        lc_modal(c, 7, w, LC_ACCENT, "Message", LC_INK, &top, &left);
         if (w > c->cols) w = c->cols;
         centre(c, top + 2, left + 1, w - 2, m->modal_title);
         ui_cells_text(c, top + 4, left + 3, "> ", 2);
@@ -1448,7 +1469,7 @@ static void draw_modal(ui_cells *c, const lc_model *m, int *cr, int *cc)
     }
     if (m->modal == LC_MODAL_RECONNECT) {               /* TS ui/disconnection-modal.ts: Retry in T.ok, Cancel in T.alert */
         char attempt[32];
-        ui_cells_modal(c, 12, w, LC_ACCENT, "Connection Error", LC_INK, &top, &left);
+        lc_modal(c, 12, w, LC_ACCENT, "Connection Error", LC_INK, &top, &left);
         if (w > c->cols) w = c->cols;
         ui_cells_pen(c, LC_ALERT, UI_CELLS_DEFAULT, 0);
         centre(c, top + 2, left + 1, w - 2, "Lost connection to server");
@@ -1463,7 +1484,7 @@ static void draw_modal(ui_cells *c, const lc_model *m, int *cr, int *cc)
         ui_hit_add(&lc_hits, LC_HIT_NO, top + 8, left + 29, 3, 10);
         return;
     }
-    ui_cells_modal(c, 12, w, LC_ACCENT, "Message", LC_INK, &top, &left);
+    lc_modal(c, 12, w, LC_ACCENT, "Message", LC_INK, &top, &left);
     if (w > c->cols) w = c->cols;
     centre(c, top + 3, left + 1, w - 2, m->modal_title);
     centre(c, top + 5, left + 1, w - 2, m->modal_text);
@@ -1488,7 +1509,7 @@ static void draw_search(ui_cells *c, const lc_model *m, int *cr, int *cc)
     int h = c->rows * 9 / 10, w = c->cols * 9 / 10, top, left, fw, ux, rt, rh, rw, i;
     static const char *const help = "Enter: Search | Tab: Next field | Esc: Close";
     ui_cells_pen(c, LC_INK, UI_CELLS_DEFAULT, 0);
-    ui_cells_modal(c, h, w, LC_ACCENT, "Message Search", LC_INK, &top, &left);
+    lc_modal(c, h, w, LC_ACCENT, "Message Search", LC_INK, &top, &left);
     ui_hit_add(&lc_hits, LC_HIT_SEARCH, top, left, h, w);
     fw = (w - 4) / 2 - 1;
     ux = left + w / 2;
@@ -1564,7 +1585,7 @@ static void draw_settings(ui_cells *c, const lc_model *m)
     char t[80];
     lc_settings_layout(c->cols, c->rows, &h, &w, row, &head, &rule, &status);
     ui_cells_pen(c, LC_INK, UI_CELLS_DEFAULT, 0);
-    ui_cells_modal(c, h, w, LC_ACCENT, "Settings", LC_INK, &top, &left);
+    lc_modal(c, h, w, LC_ACCENT, "Settings", LC_INK, &top, &left);
     ui_hit_add(&lc_hits, LC_HIT_SETTINGS, top, left, h, w);
     for (i = 0; i < 64; i++) set_item_at[i] = -1;
     top++; left++;                                  /* the interior: TS top/left are inside the border */
@@ -1615,7 +1636,7 @@ static void draw_theme(ui_cells *c, const lc_model *m)
     char t[160];
     int namew = theme_name_col();
     ui_cells_pen(c, LC_INK, UI_CELLS_DEFAULT, 0);
-    ui_cells_modal(c, h, w, LC_CHROME, " Theme ", LC_INK, &top, &left);
+    lc_modal(c, h, w, LC_CHROME, " Theme ", LC_INK, &top, &left);
     ui_hit_add(&lc_hits, LC_HIT_THEME, top, left, h, w);
     top++; left++;
     vis = n < h - 3 ? n : h - 3;
@@ -1712,6 +1733,7 @@ static void pick_draw(ui_cells *c, const lc_model *m)
     ui_cells_pen(c, LC_INK, UI_CELLS_DEFAULT, 0);
     ui_cells_fill(c, p->top + 1, p->left + 1, h - 2, LC_PICK_W - 2, ' ');
     ui_cells_box(c, p->top, p->left, h, LC_PICK_W, LC_ACCENT, 0, 0);
+    cover(p->top, p->left, h, LC_PICK_W);
     for (k = 0; k < 3; k++) {
         ui_cells_pen(c, k == p->page ? LC_INK : LC_ACCENT, k == p->page ? LC_ACCENT : UI_CELLS_DEFAULT, 0);
         ui_cells_text(c, p->top + 1, p->left + 1 + k * 5, tab[k], 4);
@@ -1740,6 +1762,7 @@ static void lc_draw_canvas(ui_cells *c, const lc_model *m, int *cursor_row, int 
     char status[160];
 
     ui_hit_reset(&lc_hits);
+    lc_cover_n = 0;
     ui_cells_pen(c, UI_CELLS_DEFAULT, UI_CELLS_DEFAULT, 0);
     ui_cells_fill(c, 0, 0, H, W, ' ');
     for (r = 0; r < vh; r++) {
@@ -1774,6 +1797,7 @@ void lc_draw(ui_cells *c, const lc_model *m, int *cursor_row, int *cursor_col)
     int k;
 
     ui_hit_reset(&lc_hits);
+    lc_cover_n = 0;
     bar_rows = 0;                                   /* no scrollbar until draw_chat draws one */
     draw_menubar(c);
     for (k = 0; k < LC_MENUS; k++)
@@ -1794,11 +1818,13 @@ void lc_draw(ui_cells *c, const lc_model *m, int *cursor_row, int *cursor_col)
         int mw = ui_cells_menu(c, 1, menu_col[m->menu] - 1, lc_menu_items[m->menu], lc_menu_count[m->menu],
                                m->menu_sel, LC_ACCENT, LC_INK, LC_ACCENT);
         ui_hit_add(&lc_hits, LC_HIT_DROPDOWN, 2, menu_col[m->menu], lc_menu_count[m->menu], mw - 2);
+        cover(1, menu_col[m->menu] - 1, lc_menu_count[m->menu] + 2, mw);
     }
     draw_slash(c, m);
     if (m->ctx.open) {
         ui_popup_draw(c, &m->ctx, LC_ACCENT, LC_INK, LC_ACCENT, LC_ALERT);
         ui_hit_add(&lc_hits, LC_HIT_POPUP, m->ctx.top, m->ctx.left, m->ctx.n + 2, m->ctx.w);
+        cover(m->ctx.top, m->ctx.left, m->ctx.n + 2, m->ctx.w);
     }
     if (m->fmt) draw_fmt(c, m);
     if (m->help) draw_help(c, m);
@@ -1817,8 +1843,13 @@ int lc_scroll_at(int row)
     pos = row - bar_body - bar_thumb / 2;
     if (pos > track) pos = track;
     if (pos < 0) pos = 0;
-    return track > 0 ? bar_span - (pos * bar_span + track / 2) / track : 0;   /* draw_chat's pos = first*track/span, inverted */
+    /* draw_chat's pos = first*track/span (floor), inverted: first is rounded up so the next draw puts the
+     * thumb on the row it was dragged to, not one row above it. */
+    return track > 0 ? bar_span - (pos * bar_span + track - 1) / track : 0;
 }
+
+/** How far the last drawn chat pane can scroll back, in rows; 0 when it had no scrollbar. */
+int lc_scroll_max(void) { return bar_rows > 0 ? bar_span : 0; }
 
 int lc_hit(int row, int col, int *index)
 {

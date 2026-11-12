@@ -75,6 +75,12 @@ typedef struct {
     long sent;             /* cells sent by the last flush */
     const char *const *wide; /* UI_CELLS_M_WIDE glyphs, id 1 = wide[0]; 0: none */
     int nwide;
+    /* What the terminal was left with, so the next ui_cells_present sends no move, colour or cursor
+     * sequence it already has. Unknown (-1 / t_have 0) after ui_cells_forget. */
+    int t_row, t_col;      /* cursor, 0-based */
+    int t_have;            /* 1: t_style is the terminal's current SGR state */
+    int t_show;            /* text cursor: 1 shown, 0 hidden */
+    ui_cell t_style;
 } ui_cells;
 
 /** Registers the two-column glyphs UI_CELLS_M_WIDE refers to (after ui_cells_open). A glyph whose
@@ -119,9 +125,21 @@ void ui_cells_bar(ui_cells *c, int row, int col, int w, const char *text, int fg
 void ui_cells_button(ui_cells *c, int top, int left, int w, const char *text, int border_fg, int fg);
 
 typedef void (*ui_cells_drain_fn)(void *ctx);
-/** Sends the cells that differ from what was last sent: CUP only on a jump, one reset-led SGR per
- *  style change. The bottom-right cell is never sent (it would scroll some terminals). */
+/** Sends the cells that differ from what was last sent, in as few bytes as it can: no cursor move
+ *  between neighbours, ESC[nC or the cells themselves over a short unchanged gap, and on a style change
+ *  only the part that differs (the reset-led ESC[0;... form when an attribute has to go). A blank goes
+ *  out in whatever foreground the terminal holds. The bottom-right cell is never sent (it would scroll
+ *  some terminals). Assumes nothing about the terminal's cursor or colours before, and leaves nothing
+ *  assumed after: the caller may write to the terminal itself between flushes. */
 void ui_cells_flush(ui_cells *c, ansi_buf *out, ui_cells_drain_fn drain, void *ctx);
+/** One frame of a door that owns the whole screen: the flush, then the text cursor shown at (cr, cc)
+ *  (0-based) when `caret`, hidden when not. Unlike ui_cells_flush it REMEMBERS where it left the
+ *  terminal's cursor, colours and cursor visibility, and the next call sends only what differs: a key
+ *  typed at the caret is one byte on the wire. A door that writes anything else to the terminal
+ *  (a picture, a clipboard sequence, ansi_* calls) calls ui_cells_forget after it. */
+void ui_cells_present(ui_cells *c, ansi_buf *out, ui_cells_drain_fn drain, void *ctx, int caret, int cr, int cc);
+/** The terminal's cursor and colours are no longer what ui_cells_present left. ui_cells_invalidate does this too. */
+void ui_cells_forget(ui_cells *c);
 
 /* ---- Hit-testing: rectangles with an id, the last one added wins (it is drawn on top). ---- */
 #define UI_HIT_MAX 32
